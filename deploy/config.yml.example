@@ -1,0 +1,25 @@
+# 生产环境数据库配置模板
+# 部署位置：/opt/fastapi/src/config/config.yml
+#
+# 注意：该文件被 .gitignore 忽略，不会随代码一起下发到服务器，必须在服务器上单独创建。
+# 创建后请收紧权限（deploy.sh 会自动处理）：
+#     chown fastapi:fastapi /opt/fastapi/src/config/config.yml
+#     chmod 600 /opt/fastapi/src/config/config.yml
+#
+# 另外注意：仓库里同目录还有一个空的 config.yaml，代码实际读取的是本文件 config.yml，不要搞混。
+
+mysql:
+  # ── host 二选一 ────────────────────────────────────────────
+  # 【方案 A】在同一台 ECS 上自建 MySQL：写 127.0.0.1
+  #            安装步骤见 deploy/DATABASE.md，或直接跑 deploy/install-mysql.sh
+  # host: "127.0.0.1"
+  #
+  # 【方案 B】用阿里云 RDS：填「内网地址」（RDS 控制台 → 数据库连接 → 内网地址）
+  #            必须用内网地址，走公网地址会产生流量费用且延迟高
+  host: "rm-xxxxxxxxxxxx.mysql.rds.aliyuncs.com"
+  port: 3306
+  # 建议单独创建低权限应用账号，不要直接用高权限账号
+  user: "fastapi_app"
+  password: "在此填写强密码"
+  database: "zentao"
+  charset: "utf8mb4"

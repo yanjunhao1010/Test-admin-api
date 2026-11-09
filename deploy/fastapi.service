@@ -1,0 +1,48 @@
+# FastAPI 后端 systemd 服务单元
+# 安装位置：/etc/systemd/system/fastapi.service（deploy.sh 会自动安装）
+# 手动启用：systemctl daemon-reload && systemctl enable --now fastapi
+[Unit]
+Description=FastAPI backend (test management platform)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fastapi
+Group=fastapi
+WorkingDirectory=/opt/fastapi
+
+# 必须同时提供两个路径：
+#   /opt/fastapi      供 routers/*.py 里的 "from src.comment import ..."
+#   /opt/fastapi/src  供 main.py 里的 "from routers import ..."
+# 少了任何一个都会 ModuleNotFoundError
+Environment=PYTHONPATH=/opt/fastapi:/opt/fastapi/src
+
+# 密钥与运行期配置；前缀 "-" 表示文件不存在时不报错（首次部署前需先创建）
+EnvironmentFile=-/opt/fastapi/.env
+
+ExecStart=/opt/fastapi/.venv/bin/gunicorn main:app \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --workers 2 \
+    --bind 127.0.0.1:8090 \
+    --timeout 120 \
+    --graceful-timeout 30 \
+    --access-logfile - \
+    --error-logfile -
+
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=3
+KillSignal=SIGQUIT
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fastapi
+
+# 基础加固
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

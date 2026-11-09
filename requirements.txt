@@ -1,0 +1,19 @@
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.4
+openai==1.14.0
+PyYAML==6.0.1
+mysql-connector-python==8.3.0
+gunicorn==21.2.0
+
+# 以下为代码中实际 import 但原清单遗漏的依赖（部署到 Linux 后必须安装，否则启动即报错）
+pymysql==1.1.1          # src/comment/MySqlconection.py
+cryptography==42.0.5    # MySQL caching_sha2_password 认证所需
+pandas==2.2.1           # src/routers/uploadfiles.py
+numpy==1.26.4           # src/routers/uploadfiles.py
+openpyxl==3.1.2         # src/comment/read_file.py
+httpx==0.27.0           # src/routers/AIS.py
+bcrypt==5.0.0           # src/routers/users.py（用户密码哈希，与库中既有 $2b$ 哈希一致）
+apscheduler==3.11.3     # src/scheduler.py 接口自动化定时调度（AsyncIOScheduler + cron）
+tzlocal==5.4.4          # apscheduler 时区探测依赖
+python-multipart==0.0.9 # FastAPI 文件上传表单解析（缺失时 import main 直接 RuntimeError）

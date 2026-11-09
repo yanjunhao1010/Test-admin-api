@@ -1,0 +1,3681 @@
+"""AI 工作台路由（一期）
+
+覆盖：模型中心（含个人 Key、连通性探测）、提示词管理、AI 生成用例、
+AI 用例库（草稿池 → 人工采纳入库）、接口执行总结、需求文档分析与上传、
+调用日志与用量统计、配额与脱敏设置。
+
+前缀 /api/ai（main.py 里 include_router 时挂 /api）。
+所有 AI 调用同步执行，超时由 ai_models.timeout / ai_settings.per_call_max_tokens 控制。
+"""
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import io
+import pandas as pd
+import pymysql
+import re
+
+from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
+from pydantic import BaseModel
+
+from src.ai import crypto
+from src.ai import docs as docs_mod
+from src.ai import models as model_reg
+from src.ai import prompts as prompt_mod
+from src.ai import runner
+from src.ai import schema as schema_mod
+from src.ai import settings as settings_mod
+from src.ai.errors import AIConfigError, AIError, AIQuotaError, AISchemaError, AIUpstreamError
+from src.comment import MySqlconection, yaml_data
+from src.routers.auth import parse_token
+# 通知中心：AI 生成完成触发点（仅追加调用，不阻断主业务）
+from src.routers.notifications import notify
+from src.routers.uploadfiles import normalize_priority, safe_convert_dataframe
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix='/ai', tags=['ai'])
+
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config', 'config.yml'
+)
+
+
+# ---------------------------------------------------------------------------
+# 基础工具
+# ---------------------------------------------------------------------------
+def get_db_handler():
+    data = yaml_data.BaseYamlData(CONFIG_PATH).read_yaml()
+    return MySqlconection.DatabaseHandler(
+        data['mysql']['host'], data['mysql']['user'],
+        data['mysql']['password'], data['mysql']['database'],
+    )
+
+
+def _uid(request: Request) -> int:
+    token = request.headers.get('accessToken')
+    if not token:
+        return 0
+    try:
+        return parse_token(token) or 0
+    except Exception:
+        return 0
+
+
+def _ok(data: Any = None, msg: str = 'success') -> Dict[str, Any]:
+    return {'code': 200, 'msg': msg, 'data': data}
+
+
+# ---------------------------------------------------------------------------
+# AI 在途任务锁（ai_inflight）
+# 用于「刷新/切页后仍判定在途」：结果仍同步返回（不引入异步任务队列），
+# 这里只登记「谁正在跑哪个 AI 任务」，既防重复提交，又供前端挂载时禁用按钮。
+# 唯一键 (biz_type, owner_uid, ref_id)；进程重启时由 main.py 启动钩子全表清空。
+# ---------------------------------------------------------------------------
+def _inflight_upsert(db, biz_type: str, uid: int, ref_id: Any = None) -> bool:
+    """登记在途任务。返回 True=登记成功；False=已存在同键（视为重复提交）。"""
+    ref = str(ref_id) if ref_id is not None else ''
+    try:
+        db.execute_update(
+            'INSERT INTO ai_inflight (biz_type, owner_uid, ref_id, started_at) '
+            'VALUES (%s, %s, %s, NOW())', (biz_type, uid, ref))
+        return True
+    except pymysql.err.IntegrityError:
+        return False
+
+
+def inflight_mark(db, biz_type: str, uid: int, ref_id: Any = None) -> bool:
+    """对外登记入口。"""
+    return _inflight_upsert(db, biz_type, uid, ref_id)
+
+
+def inflight_clear(db, biz_type: str, uid: int, ref_id: Any = None) -> None:
+    ref = str(ref_id) if ref_id is not None else ''
+    db.execute_update(
+        'DELETE FROM ai_inflight WHERE biz_type = %s AND owner_uid = %s AND ref_id = %s',
+        (biz_type, uid, ref))
+
+
+def inflight_list(db, uid: int, biz_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    if biz_types:
+        ph = ','.join(['%s'] * len(biz_types))
+        rows = db.execute_query(
+            f'SELECT biz_type, ref_id FROM ai_inflight '
+            f'WHERE owner_uid = %s AND biz_type IN ({ph})', (uid, *biz_types))
+    else:
+        rows = db.execute_query(
+            'SELECT biz_type, ref_id FROM ai_inflight WHERE owner_uid = %s', (uid,))
+    return [{'biz_type': r['biz_type'], 'ref_id': r.get('ref_id', '')} for r in (rows or [])]
+
+
+def _raise_ai(e: Exception):
+    """把底座异常映射成合适的 HTTP 状态码（不再一律 500）"""
+    if isinstance(e, AIQuotaError):
+        raise HTTPException(status_code=429, detail=str(e))
+    if isinstance(e, AISchemaError):
+        raise HTTPException(status_code=422, detail=str(e))
+    if isinstance(e, AIConfigError):
+        raise HTTPException(status_code=400, detail=str(e))
+    if isinstance(e, AIUpstreamError):
+        raise HTTPException(status_code=502, detail=str(e))
+    if isinstance(e, AIError):
+        raise HTTPException(status_code=400, detail=str(e))
+    raise HTTPException(status_code=500, detail=str(e))
+
+
+def _has_perm(db, uid: int, code: str) -> bool:
+    """按权限点校验（admin 角色直接放行）"""
+    if not uid:
+        return False
+    try:
+        rows = db.execute_query(
+            "SELECT 1 AS ok FROM user_roles ur "
+            "JOIN roles r ON r.id = ur.role_id "
+            "WHERE ur.user_id = %s AND r.code LIKE '%%admin%%' LIMIT 1", (uid,))
+        if rows:
+            return True
+        rows = db.execute_query(
+            "SELECT 1 AS ok FROM user_roles ur "
+            "JOIN role_permissions rp ON rp.role_id = ur.role_id "
+            "JOIN permissions p ON p.id = rp.permission_id "
+            "WHERE ur.user_id = %s AND p.code = %s LIMIT 1", (uid, code))
+        return bool(rows)
+    except Exception as e:  # noqa: BLE001
+        logger.warning('权限校验失败，保守放行：%s', e)
+        return True
+
+
+def _is_admin(db, uid: int) -> bool:
+    """当前用户是否 admin 角色（roles.code 含 'admin'）"""
+    if not uid:
+        return False
+    try:
+        rows = db.execute_query(
+            "SELECT 1 AS ok FROM user_roles ur "
+            "JOIN roles r ON r.id = ur.role_id "
+            "WHERE ur.user_id = %s AND r.code LIKE '%%admin%%' LIMIT 1", (uid,))
+        return bool(rows)
+    except Exception as e:  # noqa: BLE001
+        logger.warning('admin 角色校验失败，保守拒绝：%s', e)
+        return False
+
+
+def _insert_id(db, sql: str, params) -> int:
+    """INSERT 并返回自增 id（DatabaseHandler 只返回影响行数）"""
+    db._ensure_connection()  # noqa: SLF001  同项目内复用连接
+    with db.connection.cursor() as cur:
+        cur.execute(sql, params)
+        new_id = cur.lastrowid
+    db.connection.commit()
+    return new_id
+
+
+def _batch_id() -> str:
+    return time.strftime('%Y%m%d%H%M%S') + '-' + uuid.uuid4().hex[:6]
+
+
+def _clip(text: Any, size: int) -> str:
+    if text is None:
+        return ''
+    s = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+    return s if len(s) <= size else s[:size] + '…(已截断)'
+
+
+def _json_loads(raw: Any, default: Any = None):
+    if raw is None or raw == '':
+        return default
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+def _int_list(raw: Any) -> List[int]:
+    """'1,2,3' / [1,2] → [1,2]，过滤非法值，避免把输入拼进 SQL"""
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, list) else str(raw).split(',')
+    out = []
+    for i in items:
+        try:
+            out.append(int(i))
+        except Exception:
+            continue
+    return out
+
+
+# ===========================================================================
+# 一、模型中心
+# ===========================================================================
+class ModelSave(BaseModel):
+    id: Optional[int] = None
+    name: str
+    provider: str = 'custom'
+    base_url: str
+    api_key: str = ''
+    model_name: str
+    model_type: str = 'chat'
+    scope: int = 1                      # 0 全局（需权限） 1 个人
+    temperature: float = 0.30
+    max_tokens: Optional[int] = None
+    timeout: int = 300
+    priority: int = 10
+    is_default: int = 0
+    enabled: int = 1
+    remark: Optional[str] = ''
+    cost_per_1k: Optional[float] = 0.0   # 每千 token 估算费用（元），0 表示未配置
+
+
+@router.get('/models')
+def list_models(request: Request):
+    """当前用户可见的模型：全局（只读）+ 自己名下的"""
+    try:
+        uid = _uid(request)
+        with get_db_handler() as db:
+            rows = model_reg.list_models(db, uid)
+            items = [model_reg.to_public(r) for r in rows]
+            return _ok({
+                'list': items,
+                'uid': uid,
+                'can_manage_global': _has_perm(db, uid, 'menu:ai:model'),
+            })
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询模型列表失败：%s' % e)
+
+
+@router.post('/models')
+def create_model(request: Request, data: ModelSave):
+    try:
+        uid = _uid(request)
+        base_url = (data.base_url or '').strip().rstrip('/')
+        if not base_url.startswith('http'):
+            raise HTTPException(status_code=400, detail='接口地址必须以 http/https 开头')
+        if not data.model_name.strip():
+            raise HTTPException(status_code=400, detail='模型名不能为空')
+        # 本地模型（Ollama/vLLM）可留空 key；非本地必须填
+        if not data.api_key.strip() and not _is_local_url(base_url):
+            raise HTTPException(status_code=400, detail='API Key 不能为空（本地模型可留空）')
+        if not data.base_url.strip():
+            raise HTTPException(status_code=400, detail='接口地址不能为空')
+
+        scope = 0 if int(data.scope) == 0 else 1
+        with get_db_handler() as db:
+            if scope == 0 and not _has_perm(db, uid, 'menu:ai:model'):
+                raise HTTPException(status_code=403, detail='无权添加全局模型（需要「全局模型管理」权限）')
+            owner = 0 if scope == 0 else uid
+            enc = crypto.encrypt(data.api_key.strip()) if data.api_key.strip() else ''
+            new_id = _insert_id(
+                db,
+                'INSERT INTO ai_models (name, provider, base_url, api_key_enc, model_name, model_type, '
+                'owner_user_id, scope, temperature, max_tokens, timeout, priority, is_default, enabled, '
+                'remark, cost_per_1k, create_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                (data.name.strip(), data.provider or 'custom', base_url, enc, data.model_name.strip(),
+                 'reasoner' if (data.model_type or '').lower() == 'reasoner' else 'chat',
+                 owner, scope, data.temperature, data.max_tokens, data.timeout, data.priority,
+                 int(data.is_default), int(data.enabled), data.remark or '', float(data.cost_per_1k or 0), uid),
+            )
+            if int(data.is_default):
+                model_reg.set_default(db, new_id, uid)
+            return _ok({'id': new_id}, '模型已添加')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='添加模型失败：%s' % e)
+
+
+@router.put('/models')
+def update_model(request: Request, data: ModelSave):
+    try:
+        if not data.id:
+            raise HTTPException(status_code=400, detail='缺少模型 id')
+        uid = _uid(request)
+        with get_db_handler() as db:
+            row = model_reg.get_row(db, data.id)
+            if not row:
+                raise HTTPException(status_code=404, detail='模型不存在或已删除')
+            owner = row.get('owner_user_id') or 0
+            if owner == 0 and not _has_perm(db, uid, 'menu:ai:model'):
+                raise HTTPException(status_code=403, detail='无权修改全局模型（需要「全局模型管理」权限）')
+            if owner != 0 and owner != uid:
+                raise HTTPException(status_code=403, detail='无权修改他人的个人模型')
+
+            base_url = (data.base_url or '').strip().rstrip('/')
+            if not base_url.startswith('http'):
+                raise HTTPException(status_code=400, detail='接口地址必须以 http/https 开头')
+
+            # 密钥留空或回传掩码 = 不修改
+            if crypto.is_mask_value(data.api_key):
+                db.execute_update(
+                    'UPDATE ai_models SET name=%s, provider=%s, base_url=%s, model_name=%s, model_type=%s, '
+                    'temperature=%s, max_tokens=%s, timeout=%s, priority=%s, enabled=%s, remark=%s, '
+                    'cost_per_1k=%s WHERE id=%s',
+                    (data.name.strip(), data.provider or 'custom', base_url, data.model_name.strip(),
+                     'reasoner' if (data.model_type or '').lower() == 'reasoner' else 'chat',
+                     data.temperature, data.max_tokens, data.timeout, data.priority,
+                     int(data.enabled), data.remark or '', float(data.cost_per_1k or 0), data.id),
+                )
+            else:
+                db.execute_update(
+                    'UPDATE ai_models SET name=%s, provider=%s, base_url=%s, api_key_enc=%s, model_name=%s, '
+                    'model_type=%s, temperature=%s, max_tokens=%s, timeout=%s, priority=%s, enabled=%s, '
+                    'remark=%s, cost_per_1k=%s WHERE id=%s',
+                    (data.name.strip(), data.provider or 'custom', base_url,
+                     crypto.encrypt(data.api_key.strip()), data.model_name.strip(),
+                     'reasoner' if (data.model_type or '').lower() == 'reasoner' else 'chat',
+                     data.temperature, data.max_tokens, data.timeout, data.priority,
+                     int(data.enabled), data.remark or '', float(data.cost_per_1k or 0), data.id),
+                )
+            if int(data.is_default):
+                model_reg.set_default(db, data.id, uid)
+            return _ok(None, '模型已更新')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='更新模型失败：%s' % e)
+
+
+@router.post('/models/default')
+async def set_default_model(request: Request):
+    body = await request.json()
+    model_id = body.get('id') or body.get('model_id')
+    uid = _uid(request)
+    try:
+        with get_db_handler() as db:
+            row = model_reg.get_row(db, model_id)
+            if not row:
+                raise HTTPException(status_code=404, detail='模型不存在或已删除')
+            owner = row.get('owner_user_id') or 0
+            if owner == 0 and not _has_perm(db, uid, 'menu:ai:model'):
+                raise HTTPException(status_code=403, detail='无权设置全局默认模型')
+            if owner != 0 and owner != uid:
+                raise HTTPException(status_code=403, detail='无权修改他人的个人模型')
+            model_reg.set_default(db, model_id, uid)
+            return _ok(None, '已设为默认模型')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='设置默认模型失败：%s' % e)
+
+
+@router.post('/models/delete')
+async def delete_model(request: Request):
+    body = await request.json()
+    model_id = body.get('id') or body.get('model_id')
+    uid = _uid(request)
+    try:
+        with get_db_handler() as db:
+            row = model_reg.get_row(db, model_id)
+            if not row:
+                raise HTTPException(status_code=404, detail='模型不存在或已删除')
+            owner = row.get('owner_user_id') or 0
+            if owner == 0 and not _has_perm(db, uid, 'menu:ai:model'):
+                raise HTTPException(status_code=403, detail='无权删除全局模型')
+            if owner != 0 and owner != uid:
+                raise HTTPException(status_code=403, detail='无权删除他人的个人模型')
+            # 被调用过的不能删（否则历史日志与报告的 model_id 直接悬空），只能停用
+            rows = db.execute_query('SELECT COUNT(*) AS n FROM ai_logs WHERE model_id = %s', (model_id,))
+            used = rows[0]['n'] if rows else 0
+            if used:
+                raise HTTPException(
+                    status_code=400,
+                    detail='该模型已被调用过 %d 次，不能删除；请改为「停用」（历史记录需要保留模型信息）' % used)
+            db.execute_update('UPDATE ai_models SET is_del = 1, enabled = 0 WHERE id = %s', (model_id,))
+            return _ok(None, '模型已删除')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='删除模型失败：%s' % e)
+
+
+@router.post('/models/{model_id}/test')
+def test_model(request: Request, model_id: int):
+    """连通性 + 能力探测：真实发一次极小请求"""
+    try:
+        uid = _uid(request)
+        # AI 在途锁：同一模型探测期间拒绝重复提交（刷新/切页后仍可判定在途）
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'test_model', uid, model_id):
+                raise HTTPException(status_code=409, detail='该模型正在探测中，请稍候')
+        with get_db_handler() as db:
+            row = model_reg.get_row(db, model_id)
+            if not row:
+                raise HTTPException(status_code=404, detail='模型不存在或已删除')
+            if not model_reg.can_use(row, uid):
+                raise HTTPException(status_code=403, detail='无权测试他人的个人模型')
+            result = model_reg.test_and_save(db, model_id)
+            return _ok(result, '探测完成' if result.get('ok') else '探测失败')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='探测失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'test_model', uid, model_id)
+
+
+# ===========================================================================
+# 二、提示词管理
+# ===========================================================================
+class PromptSave(BaseModel):
+    id: Optional[int] = None
+    code: str
+    name: str
+    model_type: str = 'chat'
+    temperature: float = 0.30
+    system_prompt: Optional[str] = ''
+    user_prompt_template: Optional[str] = ''
+    output_schema: Optional[str] = ''
+    description: Optional[str] = ''
+    enabled: int = 1
+    scope: str = 'global'  # global=全局默认 personal=个人专属(owner=create_by)
+
+
+class PromptRestore(BaseModel):
+    code: str
+    scope: str = 'global'  # global=恢复全局默认 personal=仅恢复本人专属
+
+
+@router.get('/prompts')
+def list_prompts(request: Request):
+    try:
+        uid = _uid(request)
+        with get_db_handler() as db:
+            # 只返回：全局默认(global) 全部 + 本人个人专属(personal, create_by=uid)
+            rows = db.execute_query(
+                'SELECT id, code, name, model_type, version, temperature, system_prompt, '
+                'user_prompt_template, output_schema, description, enabled, update_time, '
+                'scope, create_by FROM ai_prompts '
+                'WHERE (is_del = 0 AND scope = \'global\') '
+                'OR (scope = \'personal\' AND create_by = %s AND is_del = 0 AND enabled = 1) '
+                'ORDER BY code ASC, version DESC', (uid,))
+            items = []
+            for r in rows or []:
+                r['temperature'] = float(r['temperature']) if r.get('temperature') is not None else None
+                r['is_builtin'] = 0
+                r['scope'] = r.get('scope') or 'global'
+                items.append(r)
+            # 内置模板：global 表里没有对应 code 时补一条「内置默认」便于查看与恢复
+            global_codes = {r['code'] for r in items if r['scope'] == 'global'}
+            for code, cfg in prompt_mod.BUILTIN_PROMPTS.items():
+                if code in global_codes:
+                    continue
+                items.append({
+                    'id': None, 'code': code, 'name': cfg['name'],
+                    'model_type': cfg.get('model_type', 'chat'), 'version': 0,
+                    'temperature': cfg.get('temperature'), 'system_prompt': cfg.get('system'),
+                    'user_prompt_template': cfg.get('user'),
+                    'output_schema': prompt_mod.schema_text(cfg.get('output_schema')),
+                    'description': cfg.get('description'), 'enabled': 1, 'is_builtin': 1,
+                    'update_time': None, 'scope': 'global',
+                })
+            return _ok({'list': items})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询提示词失败：%s' % e)
+
+
+@router.post('/prompts')
+def save_prompt(request: Request, data: PromptSave):
+    """保存提示词。
+
+    - scope='personal'：本人专属，编辑时在同一条记录上覆盖更新（不新增版本、不增 version）
+    - scope='global'：全局默认，仅 admin 角色可改，保留版本历史（每次新增一版并停用旧版）
+    """
+    try:
+        uid = _uid(request)
+        if not data.code.strip():
+            raise HTTPException(status_code=400, detail='模板编码不能为空')
+        scope = (data.scope or 'global').strip().lower()
+        if scope not in ('global', 'personal'):
+            raise HTTPException(status_code=400, detail='scope 必须为 global 或 personal')
+        with get_db_handler() as db:
+            if scope == 'global':
+                # 仅 admin 角色可改全局默认（保留版本历史）
+                if not _is_admin(db, uid):
+                    raise HTTPException(status_code=403, detail='仅管理员可修改全局默认提示词')
+                rows = db.execute_query(
+                    'SELECT MAX(version) AS v FROM ai_prompts WHERE code = %s', (data.code.strip(),))
+                version = ((rows[0]['v'] or 0) + 1) if rows else 1
+                new_id = _insert_id(
+                    db,
+                    'INSERT INTO ai_prompts (code, name, model_type, version, temperature, system_prompt, '
+                    'user_prompt_template, output_schema, description, enabled, create_by, scope) '
+                    'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                    (data.code.strip(), data.name.strip(), data.model_type, version, data.temperature,
+                     data.system_prompt or '', data.user_prompt_template or '', data.output_schema or '',
+                     data.description or '', int(data.enabled), uid, scope),
+                )
+                # 只保留同 (code, scope='global') 下最新版本启用
+                db.execute_update(
+                    'UPDATE ai_prompts SET enabled = 0 '
+                    'WHERE code = %s AND scope = \'global\' AND id <> %s AND is_del = 0',
+                    (data.code.strip(), new_id))
+                return _ok({'id': new_id, 'version': version, 'scope': 'global'},
+                           '已保存为全局默认 v%d' % version)
+            else:
+                # personal：本人专属，编辑覆盖同一条记录，不新增版本
+                if not uid:
+                    raise HTTPException(status_code=403, detail='请先登录')
+                existing = db.execute_query(
+                    'SELECT id, version FROM ai_prompts '
+                    'WHERE code = %s AND scope = \'personal\' AND create_by = %s AND is_del = 0 '
+                    'ORDER BY version DESC LIMIT 1',
+                    (data.code.strip(), uid))
+                if existing:
+                    pid = existing[0]['id']
+                    cur_ver = existing[0]['version'] or 1
+                    db.execute_update(
+                        'UPDATE ai_prompts SET name=%s, model_type=%s, temperature=%s, '
+                        'system_prompt=%s, user_prompt_template=%s, output_schema=%s, '
+                        'description=%s, enabled=%s, update_time=NOW() '
+                        'WHERE id=%s',
+                        (data.name.strip(), data.model_type, data.temperature,
+                         data.system_prompt or '', data.user_prompt_template or '', data.output_schema or '',
+                         data.description or '', int(data.enabled), pid))
+                    return _ok({'id': pid, 'version': cur_ver, 'scope': 'personal'},
+                               '已更新我的专属提示词（v%d）' % cur_ver)
+                # 首次创建：version 取该 code 当前最大版本+1，避免与 uk_code_version 唯一键冲突
+                vrows = db.execute_query(
+                    'SELECT MAX(version) AS v FROM ai_prompts WHERE code = %s', (data.code.strip(),))
+                version = ((vrows[0]['v'] or 0) + 1) if vrows else 1
+                new_id = _insert_id(
+                    db,
+                    'INSERT INTO ai_prompts (code, name, model_type, version, temperature, system_prompt, '
+                    'user_prompt_template, output_schema, description, enabled, create_by, scope) '
+                    'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                    (data.code.strip(), data.name.strip(), data.model_type, version, data.temperature,
+                     data.system_prompt or '', data.user_prompt_template or '', data.output_schema or '',
+                     data.description or '', int(data.enabled), uid, 'personal'))
+                return _ok({'id': new_id, 'version': version, 'scope': 'personal'},
+                           '已创建我的专属提示词（v%d）' % version)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='保存提示词失败：%s' % e)
+
+
+@router.post('/prompts/delete')
+async def delete_prompt(request: Request):
+    body = await request.json()
+    pid = body.get('id')
+    uid = _uid(request)
+    if not pid:
+        raise HTTPException(status_code=400, detail='缺少 id')
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT id, scope, create_by FROM ai_prompts WHERE id = %s AND is_del = 0', (pid,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='提示词不存在或已删除')
+            row = rows[0]
+            scope = row.get('scope') or 'global'
+            if scope == 'personal':
+                if row.get('create_by') != uid:
+                    raise HTTPException(status_code=403, detail='只能删除自己的个人专属提示词')
+            else:
+                if not _is_admin(db, uid):
+                    raise HTTPException(status_code=403, detail='仅管理员可删除全局默认提示词')
+            db.execute_update('UPDATE ai_prompts SET is_del = 1, enabled = 0 WHERE id = %s', (pid,))
+            return _ok(None, '已删除（将回退到%s）'
+                       % ('全局默认或内置模板' if scope == 'global' else '全局默认/内置默认模板'))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='删除提示词失败：%s' % e)
+
+
+@router.post('/prompts/restore')
+def restore_prompt(request: Request, data: PromptRestore):
+    """恢复为默认模板：
+
+    - scope='personal'：仅停用并软删本人专属版本，回退到全局默认/内置（不需 admin）
+    - scope='global'：停用并软删该 code 全部全局版本，回退到内置默认（仅 admin，影响所有用户）
+    """
+    try:
+        uid = _uid(request)
+        if not data.code.strip():
+            raise HTTPException(status_code=400, detail='模板编码不能为空')
+        scope = (data.scope or 'global').strip().lower()
+        if scope not in ('global', 'personal'):
+            raise HTTPException(status_code=400, detail='scope 必须为 global 或 personal')
+        with get_db_handler() as db:
+            if scope == 'global':
+                if not _is_admin(db, uid):
+                    raise HTTPException(status_code=403, detail='仅管理员可恢复全局默认提示词')
+                db.execute_update(
+                    'UPDATE ai_prompts SET is_del = 1, enabled = 0 '
+                    'WHERE code = %s AND scope = \'global\' AND is_del = 0',
+                    (data.code.strip(),))
+                return _ok(None, '已恢复为系统内置默认模板（影响所有用户）')
+            else:
+                db.execute_update(
+                    'UPDATE ai_prompts SET is_del = 1, enabled = 0 '
+                    'WHERE code = %s AND scope = \'personal\' AND create_by = %s AND is_del = 0',
+                    (data.code.strip(), uid))
+                return _ok(None, '已恢复为全局默认/内置默认模板（仅本人）')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='恢复提示词失败：%s' % e)
+
+
+# ===========================================================================
+# 三、AI 生成测试用例
+# ===========================================================================
+class CaseGenReq(BaseModel):
+    project_id: Optional[int] = None
+    project_name: str = ''
+    module: str = ''
+    function_point: str = ''
+    requirement: str = ''
+    case_types: str = '正向,异常,边界'
+    count: int = 5
+    model_id: Optional[int] = None
+    case_ids: Optional[List[int]] = None  # 基于已有用例补充生成（A2 溯源：精确拉取来源用例拼进上下文）
+    # 分批生成：前端把已勾选的测试点切成若干文本块传进来，后端逐块调用模型再合并，
+    # 避免「一次要几百条」把输出撞穿 max_tokens。不传则走原来的单次调用（其他页面不受影响）。
+    batches: Optional[List[str]] = None
+
+
+class CaseGenSaveItem(BaseModel):
+    """前端勾选后回传的单条用例（字段与生成结果对齐）"""
+    module: str = ''
+    function_point: str = ''
+    priority: int = 2
+    case_type: str = ''
+    design_method: str = ''
+    pre_condition: str = ''
+    steps: str = ''
+    expected_result: str = ''
+    remark: str = ''
+    confidence: float = 0.0
+    # 若该用例来自「生成历史」明细，带上历史明细项 id，
+    # 入库后回写 ai_case_gen_history_item.draft_id，用于可靠判定「已加入库」并防重复添加
+    history_item_id: Optional[int] = None
+
+
+class CaseGenSaveReq(BaseModel):
+    project_id: Optional[int] = None
+    model_id: Optional[int] = None
+    items: List[CaseGenSaveItem] = []
+    source_case_ids: Optional[List[int]] = None  # A2 溯源：派生自哪些已有用例（存草稿）
+
+
+class CaseGenHistoryItem(BaseModel):
+    module: Optional[str] = ''
+    function_point: Optional[str] = ''
+    priority: int = 2
+    case_type: Optional[str] = ''
+    design_method: Optional[str] = ''
+    pre_condition: Optional[str] = ''
+    steps: Optional[str] = ''
+    expected_result: Optional[str] = ''
+    remark: Optional[str] = ''
+    confidence: float = 0
+    dup_case_id: Optional[int] = None
+
+
+class CaseGenHistoryReq(BaseModel):
+    project_id: Optional[int] = None
+    project_name: Optional[str] = ''
+    model_id: Optional[int] = None
+    model_name: Optional[str] = ''
+    module: Optional[str] = ''
+    function_point: Optional[str] = ''
+    requirement: Optional[str] = ''
+    elapsed_ms: Optional[int] = None
+    attempt: int = 1
+    knowledge_injected: int = 0
+    knowledge_text: str = ''
+    items: List[CaseGenHistoryItem] = []
+
+
+def _few_shot_text(db, module: str, limit: int = 4) -> str:
+    """取库内同模块已有用例，作为风格参考（few-shot），保证生成风格一致"""
+    if module:
+        rows = db.execute_query(
+            'SELECT module, function_point, pre_condition, steps, expected_result FROM test_cases '
+            'WHERE is_del = 0 AND module = %s ORDER BY id DESC LIMIT %s', (module, limit))
+    else:
+        rows = db.execute_query(
+            'SELECT module, function_point, pre_condition, steps, expected_result FROM test_cases '
+            'WHERE is_del = 0 ORDER BY id DESC LIMIT %s', (limit,))
+    if not rows:
+        return '（库内暂无同模块用例）'
+    lines = []
+    for r in rows:
+        lines.append('模块：%s / 功能点：%s\n前置条件：%s\n步骤：%s\n预期结果：%s'
+                     % (r.get('module') or '', r.get('function_point') or '',
+                        r.get('pre_condition') or '', r.get('steps') or '',
+                        r.get('expected_result') or ''))
+    return '\n---\n'.join(lines)
+
+
+_KB_TYPE_NAME = {1: '通用用例', 2: '测试要点', 3: '典型坑点/边界'}
+
+
+def _kb_knowledge(db, project_id: Optional[int], module: str = '', function_point: str = '',
+                  limit: int = 8) -> tuple:
+    """RAG 检索：从用例知识库(test_case_kb)取与本项目/模块/功能点相关、且被引用较多的条目，
+    拼成文本作为 case_gen 的 {{knowledge}} 上下文。结构化检索（按 project_id + 模糊匹配），
+    不需要 embedding / 向量库。返回 (text, count)：text 为注入用文本，count 为命中条目数；
+    无命中返回（提示语, 0），避免污染 prompt。"""
+    conds = ['is_del=0 AND status=1']
+    args: list = []
+    if project_id:
+        conds.append('project_id=%s')
+        args.append(int(project_id))
+    soft = []
+    if module:
+        soft.append('module LIKE %s')
+        args.append('%%%s%%' % module)
+    if function_point:
+        soft.append('function_point LIKE %s')
+        args.append('%%%s%%' % function_point)
+    where = ' AND '.join(conds)
+    if soft:
+        where += ' AND (%s)' % ' OR '.join(soft)
+    rows = db.execute_query(
+        'SELECT title, kb_type, module, function_point, priority, pre_condition, steps, '
+        'expected_result, scene_desc FROM test_case_kb WHERE %s '
+        'ORDER BY ref_count DESC, id DESC LIMIT %s' % (where, limit), tuple(args))
+    if not rows:
+        return '（用例知识库暂无相关条目，可忽略本段）', 0
+    lines = []
+    for r in rows:
+        tn = _KB_TYPE_NAME.get(r.get('kb_type') or 1, '通用用例')
+        lines.append(
+            '【%s】%s\n模块：%s / 功能点：%s / 优先级：%s\n适用场景：%s\n前置条件：%s\n步骤：%s\n预期结果：%s'
+            % (tn, r.get('title') or '未命名', r.get('module') or '', r.get('function_point') or '',
+               r.get('priority') or 2, r.get('scene_desc') or '', r.get('pre_condition') or '',
+               r.get('steps') or '', r.get('expected_result') or ''))
+    return '\n---\n'.join(lines), len(rows)
+
+
+# 生成用例分批大小：单批输出恒定在 max_tokens 安全区。
+# 25 条用例的 JSON 约 5k token，远低于 DeepSeek 通用 16384 的上限；再大就有截断风险。
+CASE_GEN_BATCH = 25
+# 批间隔（秒）：分批会连续建连同一上游，不间隔容易撞上代理/上游的连接数与频率限制，
+# 表现为下一批直接 Connection error。留 1s 足以让连接池与限流窗口恢复。
+CASE_GEN_BATCH_GAP = 1.0
+# 补跑阈值：单批实得 < 目标 × 该比例 就再补一次。
+# 实测模型会「自己觉得够了」提前收尾（要 25 条只回 8 条，JSON 合法且 schema 校验通过）。
+# 取 0.5：低于一半才补，避免为偶发少 1~2 条多烧一次调用。
+CASE_GEN_SHORTFALL_RATIO = 0.5
+CASE_GEN_TOPUP_HINT = (
+    '\n\n【补充生成】上一次只给出了部分用例，本次请针对上面尚未覆盖的测试点继续补充，'
+    '不要重复已给出的用例，务必输出指定条数。')
+
+
+@router.post('/case-gen')
+def case_gen(request: Request, data: CaseGenReq):
+    """生成用例（仅返回结果，不自动落库；入库由前端勾选后调用 /case-gen/save）"""
+    try:
+        uid = _uid(request)
+        count = max(1, int(data.count or 5))  # 单次条数不再硬性上限（模型输出受 max_tokens 约束，过大可能被截断）
+        # AI 在途锁：登记，若已存在同类任务则拒绝重复提交（刷新/切页后仍可判定在途）
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'case_gen', uid):
+                raise HTTPException(status_code=409, detail='已有「生成用例」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            project_name = data.project_name
+            if not project_name and data.project_id:
+                rows = db.execute_query('SELECT cate_name FROM test_case_project WHERE id = %s', (data.project_id,))
+                project_name = rows[0]['cate_name'] if rows else ''
+
+            # A2：基于已有用例补充生成——精确按 case_ids 拉取来源用例，拼进需求上下文
+            source_case_ids = [int(x) for x in (data.case_ids or []) if x]
+            source_cases_text = ''
+            src_module = data.module
+            src_fp = data.function_point
+            if source_case_ids:
+                placeholders = ','.join(['%s'] * len(source_case_ids))
+                rows = db.execute_query(
+                    'SELECT id, module, function_point, priority, pre_condition, steps, expected_result '
+                    'FROM test_cases WHERE is_del = 0 AND id IN (%s)' % placeholders,
+                    tuple(source_case_ids))
+                if rows:
+                    lines = []
+                    for r in rows:
+                        lines.append(
+                            '【已有用例%d】模块：%s / 功能点：%s / 优先级：%s\n前置条件：%s\n步骤：%s\n预期结果：%s'
+                            % (r['id'], r.get('module') or '', r.get('function_point') or '', r.get('priority'),
+                               r.get('pre_condition') or '', r.get('steps') or '', r.get('expected_result') or ''))
+                    source_cases_text = '\n'.join(lines)
+                    # 模块/功能点兜底用首条来源用例，使 few-shot 与生成上下文一致
+                    if not data.module and rows[0].get('module'):
+                        src_module = rows[0]['module']
+                    if not data.function_point and rows[0].get('function_point'):
+                        src_fp = rows[0]['function_point']
+
+            # 组装需求文本：用户原始要求 + 来源用例（A2）
+            if source_cases_text:
+                req_text = (
+                    (data.requirement + '\n\n' if data.requirement else '')
+                    + '【请基于以下已有用例，补充其缺失的边界/异常/逆向测试点，不要重复已有内容】\n'
+                    + source_cases_text
+                )
+            else:
+                req_text = data.requirement or '（未填写需求说明，请依据功能点与参考用例推断）'
+
+            kb_text, kb_count = _kb_knowledge(db, data.project_id, src_module, src_fp)
+
+            base_vars = {
+                'project_name': project_name or '未指定',
+                'module': src_module or '未指定',
+                'function_point': src_fp or '未指定',
+                'case_types': data.case_types or '正向,异常,边界',
+                'few_shot': _few_shot_text(db, src_module),
+                'knowledge': kb_text,
+            }
+
+            batches = [b for b in (data.batches or []) if (b or '').strip()]
+            if batches:
+                # 分批：每批 CASE_GEN_BATCH 条，输出量恒定在 max_tokens 安全区；
+                # 最后一批按剩余额度给，不够就少给（宁可少几条也不要被截断）。
+                items_all: List[Any] = []
+                dropped_all = 0
+                failed = 0
+                topped = 0
+                topup_failed = 0
+                last: Dict[str, Any] = {}
+                for bi, batch_text in enumerate(batches):
+                    rest = count - len(items_all)
+                    if rest <= 0:
+                        break
+                    # 批间隔：只在「上一批已产出」时等，避免第一批也白等1s
+                    if bi > 0 and items_all:
+                        time.sleep(CASE_GEN_BATCH_GAP)
+                    want = min(CASE_GEN_BATCH, rest)
+                    try:
+                        r = runner.run_structured(
+                            db, uid, biz_type='case_gen', prompt_code='case_gen',
+                            prompt_vars=dict(base_vars, count=want, requirement=batch_text),
+                            list_key='cases', item_model=schema_mod.CaseDraftItem, limit=want,
+                            model_id=data.model_id,
+                        )
+                        items_all.extend(r['items'])
+                        dropped_all += int(r.get('dropped') or 0)
+                        last = r
+                        # 补跑：模型有时「自己觉得够了」就提前收尾（实测要25 条只回 8 条，
+                        # 且 JSON 合法、schema 校验通过 —— 不是被截断也不是校验放水）。
+                        # 不补的话用户会发现「要 100 条只回来 60 条」却毫无提示。
+                        # 阈值取一半：低于一半才补，避免为偶发少1~2 条多烧一次调用。
+                        if len(r['items']) < want * CASE_GEN_SHORTFALL_RATIO:
+                            gap = want - len(items_all)
+                            if gap > 0:
+                                time.sleep(CASE_GEN_BATCH_GAP)
+                                try:
+                                    r2 = runner.run_structured(
+                                        db, uid, biz_type='case_gen', prompt_code='case_gen',
+                                        prompt_vars=dict(base_vars, count=gap,
+                                                         requirement=batch_text + '\n'
+                                         +CASE_GEN_TOPUP_HINT),
+                                        list_key='cases', item_model=schema_mod.CaseDraftItem,
+                                        limit=gap, model_id=data.model_id,
+                                    )
+                                    items_all.extend(r2['items'])
+                                    dropped_all += int(r2.get('dropped') or 0)
+                                    topped += 1
+                                    last = r2
+                                except Exception as te:  # noqa: BLE001
+                                    topup_failed += 1
+                                    logger.warning('case_gen 第 %d 批补跑失败：%s', bi + 1, te)
+                    except Exception as be:  # noqa: BLE001
+                        # 单批失败不拖垮整单：记一条日志继续下一批（与阶段2 分批同策略）
+                        failed += 1
+                        logger.warning('case_gen 第 %d/%d 批失败：%s', bi + 1, len(batches), be)
+                        # 空结果列表会让后续 rest 计算失真（len(items_all) 不变），
+                        # 但更严重的是：若这次是唯一有内容的批次，last 会是上一批的，
+                        # 导致返回结果与实际批次对不上。这里显式标记，交给调用方判断。
+                        if not items_all:
+                            last = {}
+                if not items_all:
+                    raise HTTPException(
+                        status_code=500,
+                        detail='全部分批都失败了（%d 批），请减少生成条数或换个模型后重试' % len(batches))
+                # model / usage / elapsed 等取最后一批真值；分批次数一并回传，
+                # 每批的 ai_logs 独立成行，所以成本看板按批统计是准的。
+                result = dict(last)
+                result['items'] = items_all
+                result['dropped'] = dropped_all
+                result['batches_total'] = len(batches)
+                result['batches_failed'] = failed
+                result['batches_topped_up'] = topped
+                result['topup_failed'] = topup_failed
+                # 元信息缺失时给个中性占位，避免下游result['model'] 取空炸掉
+                result.setdefault('model', {})
+                result.setdefault('usage', {})
+                result.setdefault('elapsed_ms', 0)
+                msg_extra = '，分 %d 批生成' % len(batches)
+                if topped:
+                    msg_extra += '（%d 批产出不足已自动补跑）' % topped
+                if failed:
+                    msg_extra += '（%d 批失败已跳过）' % failed
+                if topup_failed:
+                    msg_extra += '（%d 批补跑也失败）' % topup_failed
+                if len(items_all) < count:
+                    # 让用户知道「要N 条只回来 M 条」的真实原因，而不是默默少给
+                    msg_extra += '；目标 %d 条，实际产出 %d 条' % (count, len(items_all))
+            else:
+                result = runner.run_structured(
+                    db, uid, biz_type='case_gen', prompt_code='case_gen',
+                    prompt_vars=dict(base_vars, count=count, requirement=req_text),
+                    list_key='cases', item_model=schema_mod.CaseDraftItem, limit=count,
+                    model_id=data.model_id,
+                )
+                msg_extra = ''
+
+            saved = []
+            dropped_dup = 0
+            _seen_keys = set()
+            for item in result['items']:
+                # 批次内内容级去重：同一（模块 + 功能点 + 前置条件 + 步骤 + 预期结果）只保留第一条。
+                # 必须含预期结果——同一功能点下「正常/异常/边界」用例仅预期结果不同，属合法不同用例，
+                # 不能只按模块+功能点+步骤判重复（会误删异常分支）。
+                _norm_steps = re.sub(r'\s+', '', str(item.get('steps') or '')).lower()
+                _norm_exp = re.sub(r'\s+', '', str(item.get('expected_result') or '')).lower()
+                _norm_pre = re.sub(r'\s+', '', str(item.get('pre_condition') or '')).lower()
+                _key = (
+                    (item.get('module') or data.module or '').strip().lower(),
+                    (item.get('function_point') or '').strip().lower(),
+                    _norm_pre,
+                    _norm_steps,
+                    _norm_exp,
+                )
+                if _norm_steps and _key in _seen_keys:
+                    dropped_dup += 1
+                    continue
+                if _norm_steps:
+                    _seen_keys.add(_key)
+                # 与库内正式用例的疑似重复标记（仅展示，不自动入库；入库由前端勾选后调用 /case-gen/save）
+                dup_id = None
+                rows = db.execute_query(
+                    'SELECT id FROM test_cases WHERE is_del = 0 AND module = %s AND function_point = %s '
+                    'AND pre_condition = %s AND steps = %s AND expected_result = %s LIMIT 1',
+                    (item.get('module') or data.module or '', item.get('function_point') or '',
+                     item.get('pre_condition') or '', item.get('steps') or '',
+                     item.get('expected_result') or ''))
+                if rows:
+                    dup_id = rows[0]['id']
+                item['dup_case_id'] = dup_id
+                saved.append(item)
+
+            # AI 生成完成通知：生成成功 → 给生成人推一条（type=4），失败不影响生成
+            try:
+                notify(
+                    uid, 4, 'AI生成用例完成',
+                    '已生成 %d 条用例，请在「AI生成用例」页勾选后入库' % len(saved),
+                    'ai', '', '/aiwork/casegen', uid,
+                )
+            except Exception as ne:  # noqa: BLE001
+                logger.warning('case_gen 生成通知失败（不影响生成）: %s', ne)
+
+            return _ok({
+                'items': saved,
+                'dropped': result['dropped'],
+                'dropped_dup': dropped_dup,
+                'model': result['model'],
+                'usage': result['usage'],
+                'elapsed_ms': result['elapsed_ms'],
+                'attempt': result['attempt'],
+                'masked_count': result['masked_count'],
+                'source_case_ids': source_case_ids,
+                'prompt_version': result.get('prompt_version'),
+                'prompt_scope': result.get('prompt_scope'),
+                'knowledge_injected': kb_count,
+                'knowledge_text': kb_text,
+                'batches_total': result.get('batches_total') or 1,
+                'batches_failed': result.get('batches_failed') or 0,
+            }, '已生成 %d 条用例%s，请勾选后点「加入 AI 用例库」入库' % (len(saved), msg_extra))
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='生成用例失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'case_gen', uid)
+
+
+@router.post('/case-gen/save')
+def case_gen_save(request: Request, data: CaseGenSaveReq):
+    """把前端勾选的用例写入 ai_case_drafts（同一批次一个 batch_id）；未勾选的不入库"""
+    try:
+        uid = _uid(request)
+        items = data.items or []
+        if not items:
+            raise HTTPException(status_code=400, detail='请至少勾选 1 条用例再入库')
+        with get_db_handler() as db:
+            batch = _batch_id()
+            saved = []
+            source_json = json.dumps(data.source_case_ids, ensure_ascii=False) if data.source_case_ids else None
+            for it in items:
+                item_id = _insert_id(
+                    db,
+                    'INSERT INTO ai_case_drafts (batch_id, source_type, suggest_project_id, module, '
+                    'function_point, priority, case_type, design_method, pre_condition, case_steps, '
+                    'expected_result, remark, confidence, status, model_id, run_by, source_case_ids) '
+                    'VALUES (%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s)',
+                    (batch, data.project_id, (it.module or '').strip(),
+                     (it.function_point or '').strip(), it.priority or 2,
+                     it.case_type or '', it.design_method or '', it.pre_condition or '',
+                     it.steps or '', it.expected_result or '',
+                     it.remark or '', it.confidence or 0,
+                     data.model_id, uid, source_json),
+                )
+                saved.append(item_id)
+                # 若该用例来自「生成历史」明细，回写 draft_id，可靠标记「已加入 AI 用例库」
+                # 并防止从历史再次点击时重复入库
+                hid = getattr(it, 'history_item_id', None)
+                if hid:
+                    try:
+                        db.execute_update(
+                            'UPDATE ai_case_gen_history_item SET draft_id = %s WHERE id = %s',
+                            (item_id, int(hid)))
+                    except Exception as ue:  # noqa: BLE001
+                        logger.warning('回写 history_item.draft_id 失败（不影响入库）: %s', ue)
+        # AI 生成完成通知：入库完成 → 给生成人推一条（type=4）
+        try:
+            notify(
+                uid, 4, 'AI生成用例已入库',
+                '已加入 %d 条用例到 AI 用例库（批次 %s）' % (len(saved), batch),
+                'ai', batch, '/aiwork/drafts', uid,
+            )
+        except Exception as ne:  # noqa: BLE001
+            logger.warning('case_gen_save 入库通知失败（不影响入库）: %s', ne)
+        return _ok({'batch_id': batch, 'count': len(saved)}, '已加入 %d 条到 AI 用例库' % len(saved))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='加入 AI 用例库失败：%s' % e)
+
+
+# ===========================================================================
+# 三·B、AI 生成用例历史记录
+# 每次「生成」成功后由前端调用 /case-gen/history 落库（失败不影响生成）；
+# 列表/明细供 AI 生成用例页「生成历史」面板回看，即使当时未入库也不丢失。
+# ===========================================================================
+@router.post('/case-gen/history')
+def case_gen_history_save(request: Request, data: CaseGenHistoryReq):
+    """把一次生成的产物落库为历史记录（前端生成成功后调用；无用例则跳过）"""
+    try:
+        uid = _uid(request)
+        items = data.items or []
+        if not items:
+            return _ok(None, '无用例，跳过历史记录')
+        with get_db_handler() as db:
+            batch = _batch_id()
+            hid = _insert_id(
+                db,
+                'INSERT INTO ai_case_gen_history '
+                '(batch_id, run_by, project_id, project_name, model_id, model_name, '
+                'module, function_point, requirement, case_count, elapsed_ms, attempt, '
+                'knowledge_injected, knowledge_text) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                (batch, uid, data.project_id, (data.project_name or '')[:255],
+                 data.model_id, (data.model_name or '')[:100],
+                 (data.module or '')[:255], (data.function_point or '')[:512],
+                 data.requirement, len(items), data.elapsed_ms, data.attempt,
+                 int(data.knowledge_injected or 0), (data.knowledge_text or '')[:65535]))
+            rows = [
+                (hid, i, (it.module or '')[:255], (it.function_point or '')[:512],
+                 it.priority or 2, (it.case_type or '')[:32], (it.design_method or '')[:64],
+                 it.pre_condition or '', it.steps or '', it.expected_result or '',
+                 it.remark or '', it.confidence or 0, it.dup_case_id)
+                for i, it in enumerate(items)
+            ]
+            db.execute_many(
+                'INSERT INTO ai_case_gen_history_item '
+                '(history_id, seq, module, function_point, priority, case_type, design_method, '
+                'pre_condition, case_steps, expected_result, remark, confidence, dup_case_id) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)', rows)
+        return _ok({'history_id': hid, 'batch_id': batch, 'count': len(items)}, '已记录生成历史')
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='记录生成历史失败：%s' % e)
+
+
+@router.get('/case-gen/history')
+def list_case_gen_history(request: Request, pageNo: int = 1, pageSize: int = 20):
+    """生成历史列表（仅本人，按时间倒序分页）"""
+    try:
+        uid = _uid(request)
+        with get_db_handler() as db:
+            total_rows = db.execute_query(
+                'SELECT COUNT(*) AS n FROM ai_case_gen_history WHERE run_by = %s', (uid,))
+            total = total_rows[0]['n'] if total_rows else 0
+            pageNo = max(1, int(pageNo))
+            pageSize = max(1, int(pageSize)) if pageSize and int(pageSize) > 0 else 20
+            offset = (pageNo - 1) * pageSize
+            items = db.execute_query(
+                'SELECT h.id, h.batch_id, h.project_id, h.model_id, h.project_name, h.model_name, h.module, '
+                'h.function_point, h.case_count, h.elapsed_ms, h.attempt, h.create_time, '
+                'h.knowledge_injected, '
+                'u.username AS run_by_name '
+                'FROM ai_case_gen_history h LEFT JOIN users u ON u.id = h.run_by '
+                'WHERE h.run_by = %s ORDER BY h.id DESC LIMIT %s OFFSET %s',
+                (uid, pageSize, offset))
+            return _ok({'list': items or [], 'total': total, 'pageNo': pageNo, 'pageSize': pageSize})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询生成历史失败：%s' % e)
+
+
+@router.get('/case-gen/history/{history_id}')
+def get_case_gen_history_items(request: Request, history_id: int):
+    """生成历史明细：返回该次生成的所有用例"""
+    try:
+        uid = _uid(request)
+        with get_db_handler() as db:
+            head = db.execute_query(
+                'SELECT * FROM ai_case_gen_history WHERE id = %s AND run_by = %s',
+                (history_id, uid))
+            if not head:
+                raise HTTPException(status_code=404, detail='历史记录不存在或无权限')
+            rows = db.execute_query(
+                'SELECT hi.*, '
+                '(d.id IS NOT NULL AND d.status != 2) AS in_lib '
+                'FROM ai_case_gen_history_item hi '
+                'LEFT JOIN ai_case_drafts d ON d.id = hi.draft_id '
+                'WHERE hi.history_id = %s ORDER BY hi.seq ASC, hi.id ASC', (history_id,))
+            items = rows or []
+            # 「已加入 AI 用例库」判定：直接看 draft_id 外键（入库时回写）。
+            # 不再靠内容匹配，避免入库时 trim / 微调导致误判为「未加入库」。
+            # 草稿被丢弃(status=2)视为已移出用例库，可再次添加。
+            for it in items:
+                it['in_library'] = bool(it.get('in_lib'))
+                it.pop('in_lib', None)
+            return _ok({'head': head[0], 'items': items})
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询生成历史明细失败：%s' % e)
+
+
+# ===========================================================================
+# 四、AI 用例库（草稿池）
+# ===========================================================================
+@router.get('/drafts')
+def list_drafts(request: Request,
+                      pageNo: int = 1, pageSize: int = 20,
+                      status: Optional[int] = None,
+                      batch_id: str = '',
+                      mine: int = 0):
+    try:
+        uid = _uid(request)
+        where = ['1=1']
+        args: List[Any] = []
+        if status is not None and str(status) != '':
+            where.append('d.status = %s')
+            args.append(int(status))
+        if batch_id:
+            where.append('d.batch_id = %s')
+            args.append(batch_id)
+        if mine:
+            where.append('d.run_by = %s')
+            args.append(uid)
+        cond = ' AND '.join(where)
+
+        with get_db_handler() as db:
+            rows = db.execute_query('SELECT COUNT(*) AS n FROM ai_case_drafts d WHERE %s' % cond, tuple(args))
+            total = rows[0]['n'] if rows else 0
+            pageNo = max(1, int(pageNo))
+            pageSize = max(1, int(pageSize)) if pageSize and int(pageSize) > 0 else 20
+            offset = (pageNo - 1) * pageSize
+            list_sql = (
+                'SELECT d.*, p.cate_name AS suggest_project_name, m.name AS model_name, u.username AS run_by_name '
+                'FROM ai_case_drafts d '
+                'LEFT JOIN test_case_project p ON p.id = d.suggest_project_id '
+                'LEFT JOIN ai_models m ON m.id = d.model_id '
+                'LEFT JOIN users u ON u.id = d.run_by '
+                'WHERE %s ORDER BY d.id DESC LIMIT %%s OFFSET %%s' % cond)
+            items = db.execute_query(list_sql, tuple(args) + (pageSize, offset))
+            return _ok({'list': items or [], 'total': total, 'pageNo': pageNo, 'pageSize': pageSize})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询用例草稿失败：%s' % e)
+
+
+class DraftAction(BaseModel):
+    ids: List[int]
+    project_id: Optional[int] = None
+
+
+@router.post('/drafts/adopt')
+def adopt_drafts(request: Request, data: DraftAction):
+    """采纳：把草稿写入 test_cases（带 ai_generated / ai_draft_id 溯源标记）"""
+    try:
+        uid = _uid(request)
+        ids = _int_list(data.ids)
+        if not ids:
+            raise HTTPException(status_code=400, detail='请选择要采纳的草稿')
+        if not data.project_id:
+            raise HTTPException(status_code=400, detail='请选择要加入的项目（三级节点）')
+
+        with get_db_handler() as db:
+            placeholders = ','.join(['%s'] * len(ids))
+            drafts = db.execute_query(
+                'SELECT * FROM ai_case_drafts WHERE status = 0 AND id IN (%s)' % placeholders, tuple(ids))
+            if not drafts:
+                raise HTTPException(status_code=400, detail='没有可采纳的草稿（可能已被采纳或丢弃）')
+
+            adopted = []
+            for d in drafts:
+                new_id = _insert_id(
+                    db,
+                    'INSERT INTO test_cases (project_id, module, function_point, priority, pre_condition, '
+                    'steps, expected_result, remark, status, is_del, creator_id, ai_generated, ai_draft_id) '
+                    'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,0,%s,1,%s)',
+                    (data.project_id, d.get('module') or '', d.get('function_point') or '',
+                     d.get('priority') or 2, d.get('pre_condition') or '', d.get('case_steps') or '',
+                     d.get('expected_result') or '', d.get('remark') or '', uid, d['id']),
+                )
+                db.execute_update(
+                    'UPDATE ai_case_drafts SET status = 1, adopt_case_id = %s, adopt_project_id = %s, '
+                    'adopt_by = %s, adopt_time = NOW() WHERE id = %s',
+                    (new_id, data.project_id, uid, d['id']))
+                adopted.append({'draft_id': d['id'], 'case_id': new_id})
+            return _ok({'adopted': adopted, 'count': len(adopted)},
+                       '已采纳 %d 条用例到项目' % len(adopted))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='采纳失败：%s' % e)
+
+
+@router.post('/drafts/discard')
+def discard_drafts(request: Request, data: DraftAction):
+    try:
+        uid = _uid(request)
+        ids = _int_list(data.ids)
+        if not ids:
+            raise HTTPException(status_code=400, detail='请选择要丢弃的草稿')
+        with get_db_handler() as db:
+            placeholders = ','.join(['%s'] * len(ids))
+            db.execute_update(
+                'UPDATE ai_case_drafts SET status = 2, adopt_by = %s, adopt_time = NOW() '
+                'WHERE status = 0 AND id IN (' + placeholders + ')',
+                tuple([uid] + ids))
+            return _ok(None, '已丢弃 %d 条草稿' % len(ids))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='丢弃失败：%s' % e)
+
+
+@router.get('/drafts/stat')
+def drafts_stat(request: Request):
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT status, COUNT(*) AS n FROM ai_case_drafts GROUP BY status')
+            stat = {0: 0, 1: 0, 2: 0}
+            for r in rows or []:
+                stat[int(r['status'])] = r['n']
+            total = sum(stat.values())
+            rate = round(stat[1] * 100.0 / total, 1) if total else 0.0
+            return _ok({'draft': stat[0], 'adopted': stat[1], 'discarded': stat[2],
+                        'total': total, 'adopt_rate': rate})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='统计失败：%s' % e)
+
+
+# ===========================================================================
+# 五、AI 分析测试总结（接口自动化线）
+# ===========================================================================
+class ExecSummaryReq(BaseModel):
+    run_batch: Optional[int] = None
+    interface_id: Optional[int] = None
+    days: int = 7
+    limit: int = 30
+    only_failed: bool = True
+    model_id: Optional[int] = None
+
+
+@router.post('/exec-summary')
+def exec_summary(request: Request, data: ExecSummaryReq):
+    """基于 api_executions 的请求/响应快照与断言明细，输出失败根因分类与修复建议"""
+    try:
+        uid = _uid(request)
+        days = int(data.days or 7)
+        limit = max(1, min(int(data.limit or 30), 60))
+        since = datetime.now() - timedelta(days=days)
+
+        # base_*：整体口径（不受 only_failed 影响），用于概览统计展示
+        base_where = ['e.run_time >= %s']
+        base_args: List[Any] = [since]
+        if data.run_batch:
+            base_where.append('e.run_batch = %s')
+            base_args.append(int(data.run_batch))
+        if data.interface_id:
+            base_where.append('e.interface_id = %s')
+            base_args.append(int(data.interface_id))
+        base_cond = ' AND '.join(base_where)
+        # cond：明细口径（只看失败时再加一个条件）
+        cond = base_cond + (' AND e.success = 0' if data.only_failed else '')
+        args = base_args
+
+        # AI 在途锁：登记，若已存在同类任务则拒绝重复提交（刷新/切页后仍可判定在途）
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'exec_summary', uid):
+                raise HTTPException(status_code=409, detail='已有「接口执行总结」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            stat_rows = db.execute_query(
+                'SELECT COUNT(*) AS total, SUM(CASE WHEN e.success = 1 THEN 1 ELSE 0 END) AS ok, '
+                'COUNT(DISTINCT e.interface_id) AS iface FROM api_executions e WHERE %s' % base_cond,
+                tuple(base_args))
+            stat = stat_rows[0] if stat_rows else {}
+            total = int(stat.get('total') or 0)
+            ok = int(stat.get('ok') or 0)
+            fail = total - ok
+            rate = round(ok * 100.0 / total, 2) if total else 0.0
+
+            if total == 0:
+                raise HTTPException(status_code=400, detail='所选范围内没有执行记录，请换个时间范围或批次')
+
+            detail_rows = db.execute_query(
+                'SELECT e.id, e.run_time, e.http_status, e.elapsed_ms, e.success, e.assertion_result, '
+                'e.error_msg, e.request_dump, e.response_dump, e.assert_detail, e.case_tag, '
+                'i.name AS interface_name, i.method, i.url '
+                'FROM api_executions e LEFT JOIN api_interfaces i ON i.id = e.interface_id '
+                'WHERE %s ORDER BY e.run_time DESC LIMIT %%s' % cond, tuple(args) + (limit,))
+
+            lines = []
+            for r in detail_rows or []:
+                req = _json_loads(r.get('request_dump'), {}) or {}
+                resp = _json_loads(r.get('response_dump'), {}) or {}
+                asserts = _json_loads(r.get('assert_detail'), {}) or {}
+                detail_txt = []
+                for d in (asserts.get('details') or [])[:6]:
+                    if d.get('passed') is False:
+                        detail_txt.append('失败断言：%s 期望=%s 实际=%s' %
+                                          (d.get('type'), _clip(d.get('expected'), 60), _clip(d.get('actual'), 60)))
+                lines.append(
+                    '#%s [%s] %s %s\n执行时间：%s  HTTP=%s  耗时=%sms  结果=%s\n请求：%s %s\n请求体：%s\n'
+                    '响应体：%s\n错误信息：%s\n断言差异：%s'
+                    % (r['id'], '失败' if not r.get('success') else '成功',
+                       r.get('method') or '', r.get('interface_name') or r.get('url') or '',
+                       r.get('run_time'), r.get('http_status'), r.get('elapsed_ms'),
+                       r.get('assertion_result') or '', req.get('method') or '', req.get('url') or '',
+                       _clip(req.get('body'), 400), _clip(resp.get('body'), 700),
+                       _clip(r.get('error_msg'), 200),
+                       '；'.join(detail_txt) or '无'))
+            exec_text = '\n\n'.join(lines)
+
+            stats_text = ('时间范围：近 %d 天\n执行总数：%d，成功：%d，失败：%d，通过率：%s%%\n'
+                          '涉及接口数：%s\n本次分析明细条数：%d'
+                          % (days, total, ok, fail, rate, stat.get('iface') or 0, len(lines)))
+
+            result = runner.run_text(
+                db, uid, biz_type='exec_summary', prompt_code='exec_summary',
+                prompt_vars={'stats_text': stats_text, 'executions_text': exec_text},
+                model_id=data.model_id,
+            )
+
+            title = '接口执行总结（近%d天，失败%d/%d）' % (days, fail, total)
+            report_id = _insert_id(
+                db,
+                'INSERT INTO ai_reports (report_type, title, biz_type, biz_id, content_md, summary_json, '
+                'model_id, run_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                ('exec_summary', title, 'batch', str(data.run_batch or '%d天' % days),
+                 result['data'].get('text') or '',
+                 json.dumps({'total': total, 'ok': ok, 'fail': fail, 'pass_rate': rate,
+                             'days': days, 'analyzed': len(lines),
+                             # 耗时/脱敏数一并存进 summary_json：ai_reports 没有这两列，
+                             # 不存的话历史报告详情只能显示「耗时 0.0s」
+                             'elapsed_ms': result['elapsed_ms'],
+                             'masked_count': result['masked_count']}, ensure_ascii=False),
+                 result['model']['id'], uid),
+            )
+            return _ok({
+                'report_id': report_id,
+                'title': title,
+                'content_md': result['data'].get('text') or '',
+                'stat': {'total': total, 'ok': ok, 'fail': fail, 'pass_rate': rate,
+                         'analyzed': len(lines)},
+                'model': result['model'],
+                'usage': result['usage'],
+                'elapsed_ms': result['elapsed_ms'],
+                'masked_count': result['masked_count'],
+            }, '总结已生成')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='生成总结失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'exec_summary', uid)
+
+
+# ===========================================================================
+# 六、用例质量体检
+# ===========================================================================
+class CaseReviewReq(BaseModel):
+    ids: Optional[List[int]] = None
+    project_id: Optional[int] = None
+    model_id: Optional[int] = None
+
+
+@router.post('/case-review')
+def case_review(request: Request, data: CaseReviewReq):
+    try:
+        uid = _uid(request)
+        # AI 在途锁：登记，若已存在同类任务则拒绝重复提交（刷新/切页后仍可判定在途）
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'case_review', uid):
+                raise HTTPException(status_code=409, detail='已有「用例质量体检」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            if data.ids:
+                ids = _int_list(data.ids)[:50]
+                placeholders = ','.join(['%s'] * len(ids))
+                rows = db.execute_query(
+                    'SELECT id, module, function_point, priority, pre_condition, steps, expected_result '
+                    'FROM test_cases WHERE is_del = 0 AND id IN (%s)' % placeholders, tuple(ids))
+            elif data.project_id:
+                rows = db.execute_query(
+                    'SELECT id, module, function_point, priority, pre_condition, steps, expected_result '
+                    'FROM test_cases WHERE is_del = 0 AND project_id = %s ORDER BY id DESC LIMIT 50',
+                    (data.project_id,))
+            else:
+                rows = db.execute_query(
+                    'SELECT id, module, function_point, priority, pre_condition, steps, expected_result '
+                    'FROM test_cases WHERE is_del = 0 ORDER BY id DESC LIMIT 50')
+            if not rows:
+                raise HTTPException(status_code=400, detail='没有可体检的用例')
+
+            result = runner.run_structured(
+                db, uid, biz_type='case_review', prompt_code='case_review',
+                prompt_vars={'cases_json': json.dumps(rows, ensure_ascii=False, default=str)},
+                list_key='issues', item_model=schema_mod.IssueItem,
+                model_id=data.model_id,
+            )
+            issues = result['items']
+            title = '用例质量体检（%d 条用例，发现 %d 个问题）' % (len(rows), len(issues))
+            report_id = _insert_id(
+                db,
+                'INSERT INTO ai_reports (report_type, title, biz_type, biz_id, content_md, summary_json, '
+                'model_id, run_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                ('case_review', title, 'case', ','.join(str(r['id']) for r in rows[:50]),
+                 _issues_markdown(issues),
+                 json.dumps({'case_count': len(rows), 'issue_count': len(issues),
+                             'issues': issues,
+                             'elapsed_ms': result['elapsed_ms'],
+                             'masked_count': result['masked_count']}, ensure_ascii=False, default=str),
+                 result['model']['id'], uid),
+            )
+            # AI 生成完成通知：体检报告生成完成 → 给生成人推一条（type=4）
+            try:
+                notify(
+                    uid, 4, '用例质量体检已完成', title,
+                    'ai', report_id, '/aiwork/review', uid,
+                )
+            except Exception as ne:  # noqa: BLE001
+                logger.warning('case_review 完成通知失败（不影响体检）: %s', ne)
+            return _ok({
+                'report_id': report_id,
+                'title': title,
+                'issues': issues,
+                'content_md': _issues_markdown(issues),
+                'case_count': len(rows),
+                'dropped': result['dropped'],
+                'model': result['model'],
+                'usage': result['usage'],
+                'elapsed_ms': result['elapsed_ms'],
+            }, '体检完成')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='用例体检失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'case_review', uid)
+
+
+class CaseReviewDraftReq(BaseModel):
+    """F3 AI 体检（草稿态）：直接收未保存表单，而非按 ids 查库"""
+    module: str = ''
+    function_point: str = ''
+    priority: Any = None
+    pre_condition: str = ''
+    steps: str = ''
+    expected_result: str = ''
+    remark: str = ''
+    model_id: Optional[int] = None
+
+
+class CaseFromTextReq(BaseModel):
+    """F4 自然语言转结构化用例：收一段自然语言描述 + 当前上下文"""
+    text: str
+    project_id: Optional[int] = None
+    module: str = ''
+    function_point: str = ''
+    model_id: Optional[int] = None
+
+
+class CaseSuggestReq(BaseModel):
+    """F6 标签/优先级建议：收当前未保存表单内容"""
+    module: str = ''
+    function_point: str = ''
+    priority: Any = None
+    pre_condition: str = ''
+    steps: str = ''
+    expected_result: str = ''
+    remark: str = ''
+    model_id: Optional[int] = None
+
+
+@router.post('/case-review/draft')
+def case_review_draft(request: Request, data: CaseReviewDraftReq):
+    """F3：对正在填写、尚未保存的用例做质量体检。
+
+    复用 case_review 提示词与 IssueItem；输入形态从「按 ids 查库」改为「收未保存表单对象」。
+    不落库、不发通知（草稿无 case_id），仅返回 issues 供前端「采纳」回填。
+    """
+    try:
+        uid = _uid(request)
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'case_review_draft', uid):
+                raise HTTPException(status_code=409, detail='已有「草稿体检」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            draft = {
+                'id': None,
+                'module': data.module or '',
+                'function_point': data.function_point or '',
+                'priority': data.priority,
+                'pre_condition': data.pre_condition or '',
+                'steps': data.steps or '',
+                'expected_result': data.expected_result or '',
+            }
+            result = runner.run_structured(
+                db, uid, biz_type='case_review_draft', prompt_code='case_review',
+                prompt_vars={'cases_json': json.dumps([draft], ensure_ascii=False, default=str)},
+                list_key='issues', item_model=schema_mod.IssueItem,
+                model_id=data.model_id,
+            )
+            issues = result['items']
+            return _ok({
+                'issues': issues,
+                'case_count': 1,
+                'dropped': result['dropped'],
+                'model': result['model'],
+                'elapsed_ms': result['elapsed_ms'],
+            }, '体检完成' if issues else '未发现明显问题')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='草稿体检失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'case_review_draft', uid)
+
+
+@router.post('/case-from-text')
+def case_from_text(request: Request, data: CaseFromTextReq):
+    """F4：自然语言描述 → 一条结构化用例（回填表单，不落库）。"""
+    try:
+        uid = _uid(request)
+        if not (data.text or '').strip():
+            raise HTTPException(status_code=422, detail='请先输入自然语言描述')
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'case_from_text', uid):
+                raise HTTPException(status_code=409, detail='已有「AI 帮我写」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            project_name = ''
+            if data.project_id:
+                rows = db.execute_query(
+                    'SELECT cate_name FROM test_case_project WHERE id = %s', (data.project_id,))
+                project_name = rows[0]['cate_name'] if rows else ''
+            result = runner.run_structured(
+                db, uid, biz_type='case_from_text', prompt_code='case_from_text',
+                prompt_vars={
+                    'project_name': project_name or '未指定',
+                    'module': data.module or '未指定',
+                    'function_point': data.function_point or '未指定',
+                    'text': data.text or '',
+                },
+                list_key='cases', item_model=schema_mod.CaseFromTextItem, limit=1,
+                model_id=data.model_id,
+            )
+            items = result['items']
+            if not items:
+                raise HTTPException(status_code=422, detail='未能从描述中解析出结构化用例，请补充更具体的描述')
+            return _ok({
+                'case': items[0],
+                'dropped': result['dropped'],
+                'model': result['model'],
+            }, '已生成结构化用例')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='生成失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'case_from_text', uid)
+
+
+@router.post('/case-suggest')
+def case_suggest(request: Request, data: CaseSuggestReq):
+    """F6：基于已填内容建议标签与优先级（不修改用例正文，标签仅展示）。"""
+    try:
+        uid = _uid(request)
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'case_suggest', uid):
+                raise HTTPException(status_code=409, detail='已有「AI 建议」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            result = runner.run_structured(
+                db, uid, biz_type='case_suggest', prompt_code='case_suggest',
+                prompt_vars={
+                    'module': data.module or '',
+                    'function_point': data.function_point or '',
+                    'priority': data.priority if data.priority is not None else '',
+                    'pre_condition': data.pre_condition or '',
+                    'steps': data.steps or '',
+                    'expected_result': data.expected_result or '',
+                    'remark': data.remark or '',
+                },
+                list_key='suggestions', item_model=schema_mod.CaseSuggestItem, limit=1,
+                model_id=data.model_id,
+            )
+            items = result['items']
+            if not items:
+                raise HTTPException(status_code=422, detail='未能生成标签/优先级建议')
+            return _ok({
+                'suggestion': items[0],
+                'dropped': result['dropped'],
+                'model': result['model'],
+            }, '已生成建议')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='建议失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'case_suggest', uid)
+
+
+def _issues_markdown(issues: List[Dict[str, Any]]) -> str:
+    if not issues:
+        return '## 体检结果\n\n未发现明显问题。'
+    lines = ['## 体检发现 %d 个问题\n' % len(issues)]
+    for i, it in enumerate(issues, 1):
+        lines.append('### %d. [%s] 用例 #%s\n**问题**：%s\n\n**建议**：%s\n' %
+                     (i, it.get('severity') or '中', it.get('case_id') or '-',
+                      it.get('problem') or '', it.get('suggestion') or ''))
+        if it.get('fixed_steps'):
+            lines.append('**建议步骤**：\n%s\n' % it['fixed_steps'])
+        if it.get('fixed_expected'):
+            lines.append(                    '**建议预期结果**：\n%s\n' % it['fixed_expected'])
+    return '\n'.join(lines)
+
+
+# 用例质量体检单次上限，与前端 REVIEW_LIMIT、case_review 的 LIMIT 50 保持一致
+REVIEW_LIMIT = 50
+
+
+def _review_column_map(columns) -> Dict[str, Any]:
+    """体检上传专用列映射：兼容模板里两个「测试功能点」列
+    （第 1 个当 module、最后 1 个当 function_point）。"""
+    norm = [str(c).replace('\n', '').replace(' ', '').replace('（', '(').replace('）', ')').lower()
+            for c in columns]
+    col_of: Dict[str, Any] = {}
+    single = {
+        'project': ['项目', '项目名称', 'project', 'projectid', 'project_id'],
+        'module': ['所属模块', '模块', 'module'],
+        'pre_condition': ['前置条件', 'precondition', 'pre_condition'],
+        'steps': ['步骤', 'steps'],
+        'expected_result': ['预期结果', 'expectedresult', 'expected_result'],
+        'remark': ['备注', 'remark'],
+    }
+    for field, al in single.items():
+        for c, n in zip(columns, norm):
+            if n in al or any(a.replace(' ', '').lower() in n for a in al):
+                col_of.setdefault(field, c)
+                break
+    for c, n in zip(columns, norm):
+        if '优先级' in n:
+            col_of.setdefault('priority', c)
+            break
+    # 收集所有含「测试功能点」的列，原序：第 1 个当 module，最后 1 个当 function_point
+    fp_cols = [c for c, n in zip(columns, norm)
+               if ('测试功能点' in n or '功能点' in n or 'functionpoint' in n)]
+    if 'module' not in col_of and fp_cols:
+        col_of['module'] = fp_cols[0]
+    if fp_cols:
+        col_of['function_point'] = fp_cols[-1]
+    return col_of
+
+
+@router.post('/case-review/upload')
+def case_review_upload(
+        request: Request,
+        file: UploadFile = File(...),
+        model_id: Optional[int] = Form(None),
+):
+    """导入 Excel 做质量体检（仅分析，不写入用例库）。行号作为 case_id。"""
+    try:
+        uid = _uid(request)
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'case_review', uid):
+                raise HTTPException(status_code=409, detail='已有「用例质量体检」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            if not file.filename or not file.filename.lower().endswith(('.xlsx', '.xls', '.xlsm')):
+                raise HTTPException(status_code=400, detail='仅支持 Excel 文件（.xlsx/.xls/.xlsm）')
+            # 同步读底层文件（本路由是同步 def，不能用 await file.read()）
+            contents = file.file.read()
+            try:
+                xl = pd.ExcelFile(io.BytesIO(contents))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail='Excel 解析失败：%s' % e)
+            # 逐 sheet 解析：有标准表头（含 测试功能点/步骤/预期结果）的用列名映射；
+            # 无表头行（首行即数据，如模板曾出现的 Sheet2）按列位置映射，
+            # 避免多 sheet 表头不一致时盲拼导致数据错位。
+            REQ = ('function_point', 'steps', 'expected_result')
+            raw_cases = []
+            for s in xl.sheet_names:
+                try:
+                    df = pd.read_excel(
+                        io.BytesIO(contents), sheet_name=s,
+                        na_values=['', 'NA', 'N/A', 'NaN', 'null', 'NULL'], keep_default_na=True,
+                    )
+                except Exception:
+                    continue
+                if df.empty or len(df.columns) == 0:
+                    continue
+                col_map = _review_column_map(df.columns)
+                if all(k in col_map for k in REQ):
+                    use = df
+                else:
+                    # 无表头行（首行即数据）：上面 header=0 已把首行误当表头吃掉，
+                    # 这里用 header=None 重读，把所有行当数据，再按列位置映射
+                    # （列序 = 项目/模块/功能点/优先级/前置条件/步骤/预期结果/备注）
+                    try:
+                        df = pd.read_excel(
+                            io.BytesIO(contents), sheet_name=s, header=None,
+                            na_values=['', 'NA', 'N/A', 'NaN', 'null', 'NULL'], keep_default_na=True,
+                        )
+                    except Exception:
+                        continue
+                    if df.empty or len(df.columns) == 0:
+                        continue
+                    n = df.shape[1]
+                    pos = {'project': 0, 'module': 1, 'function_point': 2, 'priority': 3,
+                           'pre_condition': 4, 'steps': 5, 'expected_result': 6}
+                    if n > 7:
+                        pos['remark'] = 7
+                    use = df
+                    use.columns = ['__pos%d' % i for i in range(n)]
+                    col_map = {k: '__pos%d' % v for k, v in pos.items()}
+                records = safe_convert_dataframe(use)
+                for rec in records:
+                    vals = [rec.get(col_map.get(k)) for k in
+                            ('module', 'function_point', 'steps', 'expected_result', 'pre_condition')]
+                    if all((v is None or (isinstance(v, str) and not v.strip())) for v in vals):
+                        continue
+                    raw_cases.append({
+                        'module': rec.get(col_map.get('module')) or '',
+                        'function_point': rec.get(col_map['function_point']) or '',
+                        'priority': normalize_priority(rec.get(col_map.get('priority'))),
+                        'pre_condition': rec.get(col_map.get('pre_condition')) or '',
+                        'steps': rec.get(col_map['steps']) or '',
+                        'expected_result': rec.get(col_map['expected_result']) or '',
+                    })
+            if not raw_cases:
+                raise HTTPException(status_code=400, detail='Excel 没有有效用例数据（所有行都为空或缺少必要列）')
+            raw_count = len(raw_cases)
+            exceeded = raw_count > REVIEW_LIMIT
+            if exceeded:
+                raw_cases = raw_cases[:REVIEW_LIMIT]
+            cases = [dict(c, id=i) for i, c in enumerate(raw_cases, 1)]
+            result = runner.run_structured(
+                db, uid, biz_type='case_review', prompt_code='case_review',
+                prompt_vars={'cases_json': json.dumps(cases, ensure_ascii=False, default=str)},
+                list_key='issues', item_model=schema_mod.IssueItem,
+                model_id=model_id,
+            )
+            issues = result['items']
+            title = '用例质量体检-Excel（%d 条用例，发现 %d 个问题）' % (len(cases), len(issues))
+            report_id = _insert_id(
+                db,
+                'INSERT INTO ai_reports (report_type, title, biz_type, biz_id, content_md, summary_json, '
+                'model_id, run_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                ('case_review', title, 'case', ','.join(str(c['id']) for c in cases),
+                 _issues_markdown(issues),
+                 json.dumps({'case_count': len(cases), 'issue_count': len(issues), 'issues': issues,
+                             'elapsed_ms': result['elapsed_ms'], 'masked_count': result['masked_count']},
+                            ensure_ascii=False, default=str),
+                 result['model']['id'], uid),
+            )
+            dropped = []
+            if exceeded:
+                dropped.append('Excel 共 %d 行有效数据，超过单次上限 %d 行，仅体检前 %d 行'
+                                % (raw_count, REVIEW_LIMIT, REVIEW_LIMIT))
+            return _ok({
+                'report_id': report_id,
+                'title': title,
+                'issues': issues,
+                'content_md': _issues_markdown(issues),
+                'case_count': len(cases),
+                'dropped': dropped,
+                'model': result['model'],
+                'usage': result['usage'],
+                'elapsed_ms': result['elapsed_ms'],
+            }, '体检完成')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='Excel 体检失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'case_review', uid)
+
+
+# ===========================================================================
+# 七、需求文档：上传 / 列表 / 分析
+# ===========================================================================
+@router.post('/requirement/upload')
+async def upload_requirement(request: Request, files: List[UploadFile] = File(...),
+                             project_id: Optional[int] = Form(None)):
+    try:
+        uid = _uid(request)
+        if not files:
+            raise HTTPException(status_code=400, detail='未收到任何文件')
+        texts: List[str] = []
+        text_names: List[str] = []
+        images: List[Dict[str, Any]] = []
+        for file in files:
+            filename = file.filename or 'unnamed'
+            raw = await file.read()
+            if not raw:
+                raise HTTPException(status_code=400, detail='文件 %s 内容为空' % filename)
+            if len(raw) > 10 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail='文件 %s 过大（上限 10MB）' % filename)
+            ext = os.path.splitext(filename)[1].lower()
+            try:
+                if docs_mod.is_image_ext(filename):
+                    if len(images) >= 8:
+                        raise HTTPException(status_code=400, detail='图片最多上传 8 张')
+                    images.append(docs_mod.prep_image(filename, raw))
+                else:
+                    texts.append(docs_mod.extract_text(filename, raw))
+                    text_names.append(filename)
+            except ValueError as ve:
+                raise HTTPException(status_code=400, detail=str(ve))
+
+        text = '\n\n'.join(t for t in texts if t.strip())
+        if not text.strip() and not images:
+            raise HTTPException(status_code=400, detail='没有解析出任何文本内容，也没有有效图片')
+
+        title = (os.path.splitext(text_names[0])[0] if text_names
+                 else (images[0]['filename'] if images else '需求文档'))
+        title = title[:200]
+        with get_db_handler() as db:
+            # 归属项目：可选归类字段，不传就存 NULL（上传不阻断）。
+            # 需求三阶段分析不读它；列表页可事后用 /requirement/project 补绑。
+            pid = None
+            if project_id:
+                prow = db.execute_query(
+                    'SELECT id FROM test_case_project WHERE id = %s', (int(project_id),))
+                if not prow:
+                    raise HTTPException(status_code=400, detail='所选项目不存在')
+                pid = int(project_id)
+            new_id = _insert_id(
+                db,
+                'INSERT INTO ai_requirements (project_id, title, req_type, source_files, content_text, '
+                'source_images, img_count, status, run_by) VALUES (%s,%s,%s,%s,%s,%s,%s,0,%s)',
+                (pid, title, 1, json.dumps(text_names, ensure_ascii=False),
+                 text, json.dumps(images, ensure_ascii=False) if images else None,
+                 len(images), uid),
+            )
+            blocks = len(docs_mod.split_blocks(text)) + len(images)
+            return _ok({'id': new_id, 'title': title, 'project_id': pid,
+                        'chars': len(text), 'images': len(images), 'blocks': blocks},
+                       '已解析：%d 字符 / %d 张图片 / %d 个分析块' % (len(text), len(images), blocks))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='上传解析失败：%s' % e)
+
+
+@router.get('/requirements')
+def list_requirements(request: Request, pageNo: int = 1, pageSize: int = 20):
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query('SELECT COUNT(*) AS n FROM ai_requirements WHERE is_del = 0')
+            total = rows[0]['n'] if rows else 0
+            pageNo = max(1, int(pageNo))
+            pageSize = max(1, int(pageSize)) if pageSize and int(pageSize) > 0 else 20
+            items = db.execute_query(
+                'SELECT r.id, r.title, r.req_type, r.source_files, r.status, r.error_msg, r.run_by, '
+                'r.project_id, p.cate_name AS project_name, '
+                'r.model_id, r.img_count, m.name AS model_name, '
+                'r.create_time, CHAR_LENGTH(IFNULL(r.content_text, \'\')) AS chars, '
+                'u.username AS run_by_name FROM ai_requirements r '
+                'LEFT JOIN users u ON u.id = r.run_by '
+                'LEFT JOIN test_case_project p ON p.id = r.project_id '
+                'LEFT JOIN ai_models m ON m.id = r.model_id WHERE r.is_del = 0 '
+                'ORDER BY r.id DESC LIMIT %s OFFSET %s', (pageSize, (pageNo - 1) * pageSize))
+            return _ok({'list': items or [], 'total': total, 'pageNo': pageNo, 'pageSize': pageSize})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询需求文档失败：%s' % e)
+
+
+class ReqDeleteReq(BaseModel):
+    id: int
+
+
+@router.post('/requirements/delete')
+def delete_requirement(request: Request, data: ReqDeleteReq):
+    """软删除需求文档：只允许删除「待分析」(status=0) 的文档。"""
+    try:
+        uid = _uid(request)
+        rid = int(data.id or 0)
+        if rid <= 0:
+            raise HTTPException(status_code=400, detail='缺少需求文档 id')
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT id, status FROM ai_requirements WHERE id = %s AND is_del = 0', (rid,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            if int(rows[0]['status']) != 0:
+                raise HTTPException(status_code=400, detail='只有「待分析」状态的文档才能删除')
+            db.execute_update('UPDATE ai_requirements SET is_del = 1 WHERE id = %s', (rid,))
+            return _ok(None, '已删除')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='删除需求文档失败：%s' % e)
+
+
+class ReqProjectReq(BaseModel):
+    id: int
+    project_id: Optional[int] = None
+
+
+@router.post('/requirement/project')
+def set_requirement_project(request: Request, data: ReqProjectReq):
+    """补绑 / 解绑需求文档的归属项目（可选操作）。
+
+    归属项目只是归类字段：需求三阶段的 prompt_vars 里没有 project_id，分析结果不受影响。
+    所以这里允许传 None 解绑，也不因为没绑而阻止上传。
+    """
+    try:
+        uid = _uid(request)
+        rid = int(data.id or 0)
+        if rid <= 0:
+            raise HTTPException(status_code=400, detail='缺少需求文档 id')
+        pid = int(data.project_id) if data.project_id else None
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT id FROM ai_requirements WHERE id = %s AND is_del = 0', (rid,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            if pid is not None:
+                prow = db.execute_query(
+                    'SELECT id FROM test_case_project WHERE id = %s', (pid,))
+                if not prow:
+                    raise HTTPException(status_code=400, detail='所选项目不存在')
+            db.execute_update(
+                'UPDATE ai_requirements SET project_id = %s WHERE id = %s', (pid, rid))
+            return _ok({'id': rid, 'project_id': pid},
+                       '已绑定归属项目' if pid else '已解除归属项目绑定')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='修改归属项目失败：%s' % e)
+
+
+@router.get('/inflight')
+def list_inflight(request: Request, biz_types: str = ''):
+    """返回当前用户正在进行的 AI 任务（biz_type 列表），供前端挂载时禁用对应按钮。
+
+    biz_types 为逗号分隔的白名单（留空返回该用户全部在途）。"""
+    try:
+        uid = _uid(request)
+        wanted = [b.strip() for b in biz_types.split(',') if b.strip()] or None
+        with get_db_handler() as db:
+            rows = inflight_list(db, uid, wanted)
+        return _ok({'list': rows})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询在途任务失败：%s' % e)
+
+
+class ReqAnalyseReq(BaseModel):
+    requirement_id: int
+    model_id: Optional[int] = None
+    max_blocks: int = 8        # 单次最多分析的章节块数，避免同步请求过长
+    text_only: int = 0         # 1=直接粘贴的文本（不通过文件）
+    stage: Optional[str] = None  # 决策①C：不传=一键跑全三阶段；传 decompose/extract/audit 只跑该阶段
+
+
+class ReqStageUpdateReq(BaseModel):
+    """决策⑥：人工修改阶段1 产物后回写"""
+    requirement_id: int
+    modules: List[Dict[str, Any]] = []
+
+
+class ReqNaMarkReq(BaseModel):
+    """决策②：人工标 NA，reason 必填"""
+    requirement_id: int
+    dims: List[str] = []
+    reason: str = ''
+
+
+#: 三阶段顺序与中文名（前端 Tab 与留痕表共用）
+REQ_STAGES = ['decompose', 'extract', 'audit']
+REQ_STAGE_NAMES = {'decompose': '需求拆解', 'extract': '测试点提取', 'audit': '覆盖审计'}
+REQ_STAGE_NO = {'decompose': 1, 'extract': 2, 'audit': 3}
+
+
+def _load_req_blocks(db, req: Dict[str, Any], max_blocks: int):
+    """切块 + 图片块，返回 (used_blocks, blocks_total, skipped)"""
+    text_blocks = docs_mod.split_blocks(req.get('content_text') or '')
+    raw_imgs = req.get('source_images') or '[]'
+    try:
+        img_list = json.loads(raw_imgs) if isinstance(raw_imgs, str) else (raw_imgs or [])
+    except Exception:
+        img_list = []
+    img_list = [x for x in (img_list or []) if isinstance(x, dict) and x.get('data_url')]
+    image_blocks = [{'section_path': '图片',
+                     'text': '（本块为上传的图片，请直接分析下方图片，不要依赖文字说明）',
+                     'images': [x['data_url']]} for x in img_list]
+    blocks = text_blocks + image_blocks
+    used = blocks[:max(1, min(int(max_blocks or 8), 20))]
+    return used, len(blocks), max(0, len(blocks) - len(used))
+
+
+def _load_payload(db, req_id: int, allow_legacy: bool = False) -> Dict[str, Any]:
+    """读 stage_payload（三阶段新增列）。
+
+    allow_legacy=False（默认，用于**阶段编排**）：只认 stage_payload。
+        必须严格 —— 否则旧 analyse_result 里转换出的测试点会让「阶段1 没跑过」的
+        文档看起来已经有测试点，阶段顺序校验会被绕过。
+
+    allow_legacy=True（用于**页面展示**）：stage_payload 为空时回落到旧
+        analyse_result 走 normalizePoints() 兼容层（决策⑦：存量只读兼容不迁移）。
+    """
+    rows = db.execute_query(
+        'SELECT stage_payload, analyse_result FROM ai_requirements WHERE id = %s', (req_id,))
+    if not rows:
+        return {}
+    row = rows[0]
+    raw = row.get('stage_payload')
+    payload = None
+    if raw:
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            payload = None
+    if isinstance(payload, dict) and payload.get('decompose'):
+        return payload
+    if not allow_legacy:
+        return payload if isinstance(payload, dict) else {}
+    legacy = (schema_mod.normalize_points(row.get('analyse_result')) or {}).get('stage_payload')
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def _save_stage(db, req_id: int, stage: str, payload: Dict[str, Any], *,
+                model_used=None, elapsed_ms: int = 0, blocks_total: int = 0,
+                blocks_done: int = 0, items: int = 0, dropped: int = 0,
+                uid: int = 0, status: int = 1) -> None:
+    """写阶段产物 + 留痕。覆盖率只存在于 audit.coverage_stat，不另存冗余字段。"""
+    payload[stage] = payload.get(stage) or {}
+    payload[stage]['generated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if model_used:
+        payload[stage]['model'] = model_used
+    payload[stage]['elapsed_ms'] = elapsed_ms
+
+    db.execute_update(
+        'UPDATE ai_requirements SET stage_payload = %s, stage = %s, total_elapsed = %s '
+        'WHERE id = %s',
+        (json.dumps(payload, ensure_ascii=False, default=str),
+         REQ_STAGE_NO.get(stage, 0), elapsed_ms, req_id))
+    if model_used:
+        db.execute_update('UPDATE ai_requirements SET model_id = %s WHERE id = %s',
+                          (model_used.get('id'), req_id))
+    db.execute_update(
+        'INSERT INTO ai_req_stage_runs (requirement_id, stage, status, blocks_total, blocks_done, '
+        'item_count, dropped_count, model_id, total_tokens, elapsed_ms, run_by, create_time) '
+        'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())',
+        (req_id, stage, status, blocks_total, blocks_done, items, dropped,
+         (model_used or {}).get('id'), 0, elapsed_ms, uid))
+
+
+def _save_coverage(db, req_id: int, coverage: Dict[str, Any],
+                   questions: List[Dict[str, Any]]) -> None:
+    db.execute_update(
+        'UPDATE ai_requirements SET coverage_stat = %s, open_questions = %s WHERE id = %s',
+        (json.dumps(coverage, ensure_ascii=False, default=str),
+         json.dumps(questions, ensure_ascii=False, default=str), req_id))
+
+
+@router.post('/requirement/analyse')
+def analyse_requirement(request: Request, data: ReqAnalyseReq):
+    """三阶段串行分析。不传 stage 一键全跑；传 stage 只跑该阶段（决策①C）。"""
+    try:
+        uid = _uid(request)
+        stage = (data.stage or '').strip() or None
+        if stage and stage not in REQ_STAGES:
+            raise HTTPException(status_code=400, detail='未知阶段：%s' % stage)
+        want = [stage] if stage else REQ_STAGES
+
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT id, title, content_text, source_images FROM ai_requirements '
+                'WHERE id = %s AND is_del = 0', (data.requirement_id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            req = rows[0]
+            used, blocks_total, skipped = _load_req_blocks(db, req, data.max_blocks)
+            if not used:
+                raise HTTPException(status_code=400, detail='该需求文档没有正文也没有图片，无法分析')
+
+            payload = _load_payload(db, req['id'])
+            db.execute_update('UPDATE ai_requirements SET status = 1 WHERE id = %s', (req['id'],))
+
+            summary: Dict[str, Any] = {'blocks_total': blocks_total,
+                                        'blocks_analysed': len(used),
+                                        'blocks_skipped': skipped,
+                                        'stages': want}
+            total_ms = 0
+            try:
+                for st in want:
+                    res = _run_req_stage(db, uid, req, used, st, payload, data.model_id)
+                    summary[st] = res['summary']
+                    total_ms += res['elapsed_ms']
+            except Exception:
+                db.execute_update('UPDATE ai_requirements SET status = 3 WHERE id = %s', (req['id'],))
+                raise
+
+            # 三阶段各自把产物写进 stage_payload；这里只统一收口状态与耗时
+            db.execute_update(
+                'UPDATE ai_requirements SET status = 2, total_elapsed = %s WHERE id = %s',
+                (total_ms, req['id']))
+
+            cov = (payload.get('audit') or {}).get('coverage_stat')
+            if not cov:
+                cov = schema_mod.calc_coverage(
+                    (payload.get('extract') or {}).get('test_points') or [], {})
+            _save_coverage(db, req['id'], cov,
+                           schema_mod.collect_open_questions(payload))
+
+            summary['elapsed_ms'] = total_ms
+            summary['stage_payload'] = payload
+            summary['coverage_stat'] = cov
+            summary['model'] = ((payload.get(want[-1]) or {}).get('model')) or None
+            return _ok(summary, '已完成：%s' % '、'.join(REQ_STAGE_NAMES[s] for s in want))
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='需求分析失败：%s' % e)
+
+
+# ---------------------------------------------------------------------------
+# 异步执行器（阶段三 R8）
+#
+# 为什么需要：需求分析三阶段串行，实测 9 模块 14 批耗时 249 秒、最坏单批 300 秒。
+# 同步 HTTP 请求会让前端「一直卡在分析中」，浏览器/网关任何一层的超时都会
+# 把用户正在等的结果直接丢掉（后端还在跑，但用户看不到也拿不到）。
+#
+# 方案第三节明确「不做 Celery/Redis」——用「后台线程 + 任务表 + 前端轮询」：
+#   1. POST /ai/requirement/analyse-async 立刻返回 task_id（毫秒级）
+#   2. 后台线程自建 DB 连接跑三阶段，每批把进度写回 ai_async_tasks
+#   3. 前端每 2 秒 GET /ai/requirement/async/{task_id} 拉进度
+# 注意：线程内绝不复用请求作用域的 db 连接，必须 get_db_handler() 自建。
+# ---------------------------------------------------------------------------
+
+# 阶段权重：decompose 通常 1~2 批，extract 最多 14 批，audit 1 次。
+# 用「已完成批次数 / 总批次数」算总进度，所以先要知道各阶段批数 → 由阶段自己上报。
+_STAGE_LABELS = {'decompose': '需求拆解', 'extract': '测试点提取', 'audit': '覆盖审计'}
+
+
+def _task_update(task_id: str, **fields) -> None:
+    """更新任务进度。独立连接、独立 try，写库失败只记日志不影响主流程。"""
+    if not fields:
+        return
+    cols = ', '.join('`%s` = %%s' % k for k in fields)
+    args = list(fields.values()) + [task_id]
+    try:
+        with get_db_handler() as db:
+            db.execute_update(
+                'UPDATE ai_async_tasks SET %s, update_time = NOW() WHERE task_id = %%s' % cols,
+                tuple(args))
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[需求异步] 进度写库失败 task=%s: %s', task_id, e)
+
+
+def _task_log(task_id: str, message: str, stage: str = '', level: str = 'info') -> None:
+    """写进度流水，供前端时间线与排查「卡在哪一步」。"""
+    try:
+        with get_db_handler() as db:
+            db.execute_update(
+                'INSERT INTO ai_async_task_logs (task_id, level, stage, message, create_time) '
+                'VALUES (%s, %s, %s, %s, NOW())',
+                (task_id, level, stage, (message or '')[:500]))
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[需求异步] 流水写库失败 task=%s: %s', task_id, e)
+
+
+def _req_stage_batch_count(db, req: Dict[str, Any], stage: str,
+                           payload: Dict[str, Any]) -> int:
+    """预估某阶段的总批次数（只用于算总进度，不影响执行）。"""
+    if stage == 'decompose':
+        try:
+            return max(1, len(_load_req_blocks(db, req, 8)[0]))
+        except Exception:  # noqa: BLE001
+            return 1
+    if stage == 'extract':
+        mods = (payload.get('decompose') or {}).get('modules') or []
+        n = 0
+        for mod in mods:
+            rules = len(mod.get('explicit_rules') or []) + len(mod.get('implicit_constraints') or [])
+            n += max(1, (rules + 9) // 10)
+        return max(1, n)
+    return 1
+
+
+def _run_async_requirement(task_id: str, uid: int, req_id: int,
+                           want: List[str], model_id: Optional[int]) -> None:
+    """后台线程主体：跑完三阶段并把结果落 ai_async_tasks.result。"""
+    t0 = time.time()
+    # 每阶段的 (done, total)，用于跨阶段汇总总进度
+    stage_plan: Dict[str, Tuple[int, int]] = {}
+    total_batches = 0
+
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT id, title, content_text, source_images FROM ai_requirements '
+                'WHERE id = %s AND is_del = 0', (req_id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            req = rows[0]
+            used, blocks_total, skipped = _load_req_blocks(db, req, 8)
+            if not used:
+                raise HTTPException(status_code=400, detail='该需求文档没有正文也没有图片，无法分析')
+            payload = _load_payload(db, req_id)
+
+            for st in want:
+                stage_plan[st] = (0, _req_stage_batch_count(db, req, st, payload))
+                total_batches += stage_plan[st][1]
+
+            db.execute_update('UPDATE ai_requirements SET status = 1 WHERE id = %s', (req_id,))
+
+        _task_update(task_id, status=1, total_stage=len(want), total_batch=total_batches,
+                     progress=2, cur_stage=want[0] if want else '')
+        _task_log(task_id, '开始分析，共 %d 个阶段 / 预计 %d 批'
+                  % (len(want), total_batches), want[0] if want else '')
+
+        # 已完成的总批次数（跨阶段累加）
+        done_batches_before = 0
+        summary: Dict[str, Any] = {'blocks_total': blocks_total,
+                                   'blocks_analysed': len(used),
+                                   'blocks_skipped': skipped,
+                                   'stages': want}
+        total_ms = 0
+
+        def make_progress_cb(stage: str):
+            def _cb(kw: Dict[str, Any]) -> None:
+                done = int(kw.get('done') or 0)
+                total = int(kw.get('total') or 1)
+                done_batches_before_local = sum(v[0] for k, v in stage_plan.items() if k < stage)
+                overall = int((done_batches_before_local + done) * 100 / max(1, total_batches))
+                done_stage = sum(1 for k, v in stage_plan.items() if v[0] >= v[1] and k < stage)
+                _task_update(task_id, cur_stage=stage,
+                             cur_batch='%s · %s' % (_STAGE_LABELS.get(stage, stage),
+                                                    kw.get('desc') or ''),
+                             done_batch=done_batches_before_local + done,
+                             done_stage=done_stage,
+                             progress=max(2, min(98, overall)))
+            return _cb
+
+        for st in want:
+            _task_update(task_id, cur_stage=st, cur_batch='%s 开始' % _STAGE_LABELS.get(st, st))
+            _task_log(task_id, '%s 开始' % _STAGE_LABELS.get(st, st), st)
+            with get_db_handler() as db:
+                res = _run_req_stage(db, uid, req, used, st, payload, model_id,
+                                     progress=make_progress_cb(st))
+            summary[st] = res['summary']
+            total_ms += res['elapsed_ms']
+            stage_plan[st] = (stage_plan[st][1], stage_plan[st][1])  # 该阶段标记完成
+            _task_log(task_id, '%s 完成（%.1fs）' % (_STAGE_LABELS.get(st, st),
+                                                res['elapsed_ms'] / 1000.0), st)
+
+        # 收口：统一写状态/耗时/覆盖率/待确认清单（与同步路径保持一致）
+        with get_db_handler() as db:
+            db.execute_update(
+                'UPDATE ai_requirements SET status = 2, total_elapsed = %s WHERE id = %s',
+                (total_ms, req_id))
+            cov = (payload.get('audit') or {}).get('coverage_stat')
+            if not cov:
+                cov = schema_mod.calc_coverage(
+                    (payload.get('extract') or {}).get('test_points') or [], {})
+            _save_coverage(db, req_id, cov, schema_mod.collect_open_questions(payload))
+
+        summary['elapsed_ms'] = total_ms
+        summary['stage_payload'] = payload
+        summary['coverage_stat'] = cov
+        summary['model'] = ((payload.get(want[-1]) or {}).get('model')) or None
+        summary['requirement_id'] = req_id
+        summary['title'] = req.get('title')
+
+        elapsed = int((time.time() - t0) * 1000)
+        with get_db_handler() as db:
+            db.execute_update(
+                'UPDATE ai_async_tasks SET status = 2, progress = 100, cur_batch = %s, '
+                'result = %s, elapsed_ms = %s, finish_time = NOW(), update_time = NOW() '
+                'WHERE task_id = %s',
+                ('全部完成 · 共 %d 条测试点' % len((payload.get('extract') or {}).get('test_points') or []),
+                 json.dumps(summary, ensure_ascii=False, default=str), elapsed, task_id))
+        _task_log(task_id, '分析完成，总耗时 %.1fs' % (elapsed / 1000.0))
+        logger.info('[需求异步] 任务完成 task=%s req=%s elapsed=%sms', task_id, req_id, elapsed)
+
+    except HTTPException as e:
+        _fail_task(task_id, e.detail)
+    except AIError as e:
+        _fail_task(task_id, str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.error('[需求异步] 任务异常 task=%s', task_id, exc_info=True)
+        _fail_task(task_id, '分析失败：%s' % e)
+
+
+def _fail_task(task_id: str, msg: str) -> None:
+    _task_update(task_id, status=3, cur_batch='失败', error_msg=(msg or '')[:2000])
+    _task_log(task_id, msg or '失败', level='error')
+    try:
+        with get_db_handler() as db:
+            r = db.execute_query(
+                'SELECT requirement_id FROM ai_async_tasks WHERE task_id = %s', (task_id,))
+            if r:
+                db.execute_update('UPDATE ai_requirements SET status = 3 WHERE id = %s',
+                                  (r[0]['requirement_id'],))
+    except Exception:  # noqa: BLE001
+        pass
+    logger.warning('[需求异步] 任务失败 task=%s: %s', task_id, msg)
+
+
+class ReqAnalyseAsync(BaseModel):
+    requirement_id: int
+    model_id: Optional[int] = None
+    stage: Optional[str] = None       # 不传=三阶段全跑；传=decompose/extract/audit
+    max_blocks: int = 8
+
+
+@router.post('/requirement/analyse-async')
+def analyse_requirement_async(request: Request, data: ReqAnalyseAsync):
+    """提交异步分析任务，立刻返回 task_id；进度用 GET /requirement/async/{task_id} 轮询。"""
+    try:
+        uid = _uid(request)
+        stage = (data.stage or '').strip() or None
+        if stage and stage not in REQ_STAGES:
+            raise HTTPException(status_code=400, detail='未知阶段：%s' % stage)
+        want = [stage] if stage else list(REQ_STAGES)
+
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT id, title FROM ai_requirements WHERE id = %s AND is_del = 0',
+                (data.requirement_id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+
+            # 提交前先回收僵尸，否则僵尸任务会被「复用」回来，用户永远提交不了新任务
+            db.execute_update(
+                "UPDATE ai_async_tasks SET status = 3, error_msg = '任务无响应已超时，请重新提交', "
+                "cur_batch = '已超时', finish_time = NOW(), update_time = NOW() "
+                "WHERE status IN (0, 1) AND update_time < DATE_SUB(NOW(), INTERVAL 20 MINUTE)")
+
+            # 同一人同一需求已有在途任务 → 直接返回该任务，避免重复烧 token
+            busy = db.execute_query(
+                'SELECT task_id, cur_stage, cur_batch, progress FROM ai_async_tasks '
+                'WHERE requirement_id = %s AND run_by = %s AND status IN (0, 1) '
+                'ORDER BY create_time DESC LIMIT 1',
+                (data.requirement_id, uid))
+            if busy:
+                b = busy[0]
+                return _ok({'task_id': b['task_id'], 'reused': True,
+                            'status': 1, 'progress': b['progress'],
+                            'cur_batch': b['cur_batch']},
+                           '该需求正在分析中，已为你接上现有任务')
+
+            task_id = uuid.uuid4().hex
+            db.execute_update(
+                'INSERT INTO ai_async_tasks (task_id, requirement_id, stages, status, '
+                'progress, run_by, model_id, create_time) '
+                'VALUES (%s, %s, %s, 0, 0, %s, %s, NOW())',
+                (task_id, data.requirement_id, ','.join(want), uid, data.model_id))
+
+        th = threading.Thread(target=_run_async_requirement,
+                              args=(task_id, uid, data.requirement_id, want, data.model_id),
+                              daemon=True)
+        th.start()
+        return _ok({'task_id': task_id, 'status': 0, 'reused': False,
+                    'stages': want, 'total_stage': len(want)},
+                   '已提交，正在后台分析，可离开本页稍后回来查看结果')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='提交异步任务失败：%s' % e)
+
+
+@router.get('/requirement/async/{task_id}')
+def get_async_task(request: Request, task_id: str, with_logs: int = 0):
+    """查异步任务进度。with_logs>0 时一并返回进度流水（默认不带，避免轮询变重）。"""
+    try:
+        uid = _uid(request)
+        with get_db_handler() as db:
+            # 自愈：update_time 超过 20 分钟仍停在 0/1，说明后台线程已死（进程重启由 main.py 复位，
+            # 但线程崩溃/异常逃逸这类只能靠超时判定）。前端会持续轮询，所以在这里回收最合适。
+            db.execute_update(
+                "UPDATE ai_async_tasks SET status = 3, error_msg = '任务无响应已超时，请重新提交', "
+                "cur_batch = '已超时', finish_time = NOW(), update_time = NOW() "
+                "WHERE status IN (0, 1) AND update_time < DATE_SUB(NOW(), INTERVAL 20 MINUTE)")
+            rows = db.execute_query(
+                'SELECT task_id, requirement_id, stages, status, cur_stage, progress, cur_batch, '
+                'done_batch, total_batch, done_stage, total_stage, error_msg, result, '
+                'model_id, run_by, elapsed_ms, create_time, finish_time '
+                'FROM ai_async_tasks WHERE task_id = %s', (task_id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='任务不存在或已过期')
+            t = rows[0]
+            # 别人的任务不返回（避免探测他人任务进度）
+            if t.get('run_by') and uid and int(t['run_by']) != int(uid):
+                raise HTTPException(status_code=403, detail='无权查看该任务')
+
+            data: Dict[str, Any] = {
+                'task_id': t['task_id'],
+                'requirement_id': t['requirement_id'],
+                'stages': (t.get('stages') or '').split(','),
+                'status': t['status'],          # 0排队 1运行 2完成 3失败
+                'stage_label': _STAGE_LABELS.get(t.get('cur_stage') or '', t.get('cur_stage') or ''),
+                'cur_stage': t.get('cur_stage') or '',
+                'progress': int(t.get('progress') or 0),
+                'cur_batch': t.get('cur_batch') or '',
+                'done_batch': t.get('done_batch'), 'total_batch': t.get('total_batch'),
+                'done_stage': t.get('done_stage'), 'total_stage': t.get('total_stage'),
+                'error_msg': t.get('error_msg') or '',
+                'elapsed_ms': t.get('elapsed_ms') or 0,
+                'model_id': t.get('model_id'),
+                'create_time': str(t.get('create_time') or ''),
+                'finish_time': str(t.get('finish_time') or ''),
+            }
+            if t['status'] == 2 and t.get('result'):
+                try:
+                    data['result'] = json.loads(t['result'])
+                except Exception:  # noqa: BLE001
+                    data['result'] = None
+            if with_logs:
+                lg = db.execute_query(
+                    'SELECT level, stage, message, create_time FROM ai_async_task_logs '
+                    'WHERE task_id = %s ORDER BY id ASC LIMIT %s',
+                    (task_id, int(min(max(with_logs, 1), 200))))
+                data['logs'] = [{'level': r['level'], 'stage': r['stage'],
+                                 'message': r['message'], 'time': str(r['create_time'])} for r in lg]
+
+            msg = ('分析完成' if t['status'] == 2 else
+                   ('分析失败：%s' % data['error_msg'] if t['status'] == 3 else
+                    ('%s（%d%%）' % (data['cur_batch'], data['progress']))))
+            return _ok(data, msg)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询任务失败：%s' % e)
+
+
+@router.get('/requirement/async-list')
+def list_async_tasks(request: Request, limit: int = 10):
+    """当前用户的最近异步任务，用于页面刷新后回填「正在分析」状态。"""
+    try:
+        uid = _uid(request)
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT task_id, requirement_id, status, cur_stage, progress, cur_batch, '
+                'error_msg, create_time, finish_time FROM ai_async_tasks '
+                'WHERE run_by = %s ORDER BY create_time DESC LIMIT %s',
+                (uid, int(min(max(limit, 1), 50))))
+            return _ok({'list': [{
+                'task_id': r['task_id'], 'requirement_id': r['requirement_id'],
+                'status': r['status'],
+                'stage_label': _STAGE_LABELS.get(r.get('cur_stage') or '', ''),
+                'progress': int(r.get('progress') or 0),
+                'cur_batch': r.get('cur_batch') or '',
+                'error_msg': r.get('error_msg') or '',
+                'create_time': str(r.get('create_time') or ''),
+                'finish_time': str(r.get('finish_time') or ''),
+            } for r in rows]})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询任务列表失败：%s' % e)
+
+
+def _run_req_stage(db, uid: int, req: Dict[str, Any], used: List[Dict[str, Any]],
+                   stage: str, payload: Dict[str, Any], model_id: Optional[int],
+                   progress: Optional[Callable[[Dict[str, Any]], None]] = None
+                   ) -> Dict[str, Any]:
+    """执行单个阶段并落库。阶段之间只通过 payload 传参，互不依赖调用次数。
+
+    progress: 可选进度回调（阶段三 R8 异步用）。仅用于写 ai_async_tasks 进度，
+    不传时行为与同步调用完全一致（不改变任何既有语义）。
+    """
+
+    def _tick(**kw):
+        if progress:
+            try:
+                progress(kw)
+            except Exception:  # noqa: BLE001 进度写库失败绝不能影响主流程
+                pass
+
+    req_id = req['id']
+    title = req.get('title') or ''
+    items: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, str]] = []
+    model_used = None
+    elapsed = 0
+
+    if stage == 'decompose':
+        for bi, b in enumerate(used):
+            _tick(stage='decompose', done=bi, total=len(used),
+                  desc='分析章节块「%s」' % (b.get('section_path') or '正文'))
+            r = runner.run_structured(
+                db, uid, biz_type='req_decompose', prompt_code='req_decompose',
+                prompt_vars={'title': title,
+                             'section_path': b.get('section_path') or '正文',
+                             'block_text': b.get('text') or ''},
+                list_key='modules', item_model=schema_mod.ReqModule,
+                model_id=model_id, images=b.get('images'))
+            items.extend(r['items'])
+            dropped.extend(r['dropped'])
+            model_used = r['model']
+            elapsed += r['elapsed_ms']
+        _tick(stage='decompose', done=len(used), total=len(used), desc='需求拆解完成')
+        # 决策④：某模块没有隐性约束 → 该模块校验失败重跑过仍为空则整条丢弃，
+        # 保证留下来的每个模块都至少产出了 1 条（含「文档未提及 X」的否定式条目）
+        modules, weak = [], []
+        for m in items:
+            if not (m.get('implicit_constraints') or []):
+                weak.append(m.get('module') or '')
+                continue
+            modules.append(m)
+        if weak:
+            dropped.append({'index': '-', 'reason': '以下模块未产出隐性约束（需含「文档未提及X」形式的条目）：%s'
+                                                 % '、'.join(weak[:5])})
+        # 同名模块合并（跨块）
+        merged: Dict[str, Dict[str, Any]] = {}
+        for m in modules:
+            k = m.get('module') or ''
+            if k in merged:
+                t = merged[k]
+                t['main_flow'] = list({*(t.get('main_flow') or []), *(m.get('main_flow') or [])})
+                for f in ('explicit_rules', 'implicit_constraints'):
+                    t[f] = list({*(t.get(f) or []), *(m.get(f) or [])})
+            else:
+                merged[k] = dict(m)
+        modules = list(merged.values())
+        payload['decompose'] = {'modules': modules}
+        _save_stage(db, req_id, stage, payload, model_used=model_used, elapsed_ms=elapsed,
+                    blocks_total=len(used), blocks_done=len(used), items=len(modules),
+                    dropped=len(dropped), uid=uid,
+                    status=1 if modules else 2)
+        return {'summary': {'modules': len(modules), 'dropped': dropped}, 'elapsed_ms': elapsed}
+
+    if stage == 'extract':
+        modules = (payload.get('decompose') or {}).get('modules') or []
+        if not modules:
+            raise HTTPException(status_code=400, detail='请先完成阶段1 需求拆解，再提取测试点')
+
+        # 分批策略（两级）：
+        # L1 按模块 —— 9 个模块一次性提取时输出必然撞 max_tokens(8192) 截断，
+        #    实测 #427~#429 三次重试 completion=8192/16384/24576 全被砍在同一位置。
+        # L2 大模块再按规则切片 —— 单模块规则数过多（如 19 条）时仍会撞顶（实测 #436），
+        #    所以按规则数超阈值时切成多份，每份都带上模块摘要保持上下文。
+        MAX_RULES_PER_SLICE = 10
+        slices: List[Tuple[str, Dict[str, Any], int, int]] = []  # (模块名, 切片内容, 第几片, 共几片)
+        for mod in modules:
+            mod_name = mod.get('module') or '未命名模块'
+            rules = [r for r in ((mod.get('explicit_rules') or []) + (mod.get('implicit_constraints') or []))
+                     if r is not None]
+            if len(rules) <= MAX_RULES_PER_SLICE:
+                slices.append((mod_name, mod, 1, 1))
+                continue
+            total = (len(rules) + MAX_RULES_PER_SLICE - 1) // MAX_RULES_PER_SLICE
+            n_explicit = len(mod.get('explicit_rules') or [])
+            for i in range(total):
+                part = rules[i * MAX_RULES_PER_SLICE:(i + 1) * MAX_RULES_PER_SLICE]
+                cut_explicit = part[:max(0, n_explicit - i * MAX_RULES_PER_SLICE)]
+                cut_implicit = part[max(0, n_explicit - i * MAX_RULES_PER_SLICE):]
+                slices.append((mod_name, {
+                    'module': mod_name,
+                    'summary': mod.get('summary') or '',
+                    'main_flow': mod.get('main_flow') or '',
+                    'explicit_rules': cut_explicit,
+                    'implicit_constraints': cut_implicit,
+                    '_slice': '%d/%d' % (i + 1, total),
+                }, i + 1, total))
+
+        items: List[Dict[str, Any]] = []
+        dropped: List[Dict[str, str]] = []
+        model_used = None
+        elapsed = 0
+        per_module_errors: List[Dict[str, str]] = []
+        for si, (mod_name, mod, idx, total) in enumerate(slices):
+            one = json.dumps([mod], ensure_ascii=False)
+            _tick(stage='extract', done=si, total=len(slices),
+                  desc='提取测试点 %d/%d · %s' % (idx, total, mod_name))
+            hint = ('本批次共 1 个模块，请只输出这个模块的测试点。'
+                    if total == 1 else
+                    '模块「%s」规则较多，已拆成 %d 份，这是第 %d 份，请只针对本份列出的规则产出测试点。'
+                    % (mod_name, total, idx))
+            try:
+                r = runner.run_structured(
+                    db, uid, biz_type='req_extract', prompt_code='req_extract',
+                    prompt_vars={'title': title, 'modules_text': one[:6000], 'batch_hint': hint},
+                    list_key='test_points', item_model=schema_mod.StructuredTestPoint,
+                    model_id=model_id)
+            except AIError as e:
+                # 单个切片失败不拖垮整批：记录下来继续跑，最后一并回给前端
+                per_module_errors.append({'module': mod_name,
+                                          'slice': '%d/%d' % (idx, total), 'error': str(e)})
+                continue
+            items.extend(r['items'])
+            dropped.extend(r['dropped'])
+            model_used = r['model']
+            elapsed += r['elapsed_ms']
+
+        if per_module_errors and not items:
+            # 一个都没成功 = 不是单模块问题，直接抛，让前端显示真实原因
+            raise HTTPException(
+                status_code=500,
+                detail='全部 %d 个批次提取失败。首个原因：%s'
+                       % (len(slices), per_module_errors[0]['error']))
+
+        cov = schema_mod.calc_coverage(items, _load_na(db, req_id))
+        _tick(stage='extract', done=len(slices), total=len(slices),
+              desc='测试点提取完成，共 %d 条' % len(items))
+        payload['extract'] = {'test_points': items, 'coverage_stat': cov,
+                              'module_errors': per_module_errors,
+                              'slices_total': len(slices)}
+        _save_stage(db, req_id, stage, payload, model_used=model_used, elapsed_ms=elapsed,
+                    blocks_total=len(slices), blocks_done=len(slices) - len(per_module_errors),
+                    items=len(items), dropped=len(dropped), uid=uid,
+                    status=1 if items else 2)
+        summary = {'test_points': len(items), 'coverage': cov, 'dropped': dropped}
+        if per_module_errors:
+            summary['module_errors'] = per_module_errors
+        return {'summary': summary, 'elapsed_ms': elapsed}
+
+    # audit
+    test_points = (payload.get('extract') or {}).get('test_points') or []
+    if not test_points:
+        raise HTTPException(status_code=400, detail='请先完成阶段2 测试点提取，再做覆盖审计')
+    na = _load_na(db, req_id)
+    cov = schema_mod.calc_coverage(test_points, na)
+    gaps = cov['gaps']
+    model_used = None
+    if gaps:
+        r = runner.run_structured(
+            db, uid, biz_type='req_audit', prompt_code='req_audit',
+            prompt_vars={'title': title,
+                         'points_text': json.dumps(
+                             [{k: t.get(k) for k in ('module', 'title', 'dims')}
+                              for t in test_points], ensure_ascii=False)[:10000],
+                         'gap_text': '、'.join(gaps)},
+            list_key='gaps', item_model=schema_mod.CoverageGap, model_id=model_id)
+        items = r['items']
+        dropped = r['dropped']
+        model_used = r['model']
+        elapsed = r['elapsed_ms']
+    payload['audit'] = {'gaps': items, 'coverage_stat': cov}
+    _save_stage(db, req_id, stage, payload, model_used=model_used, elapsed_ms=elapsed,
+                blocks_total=1, blocks_done=1, items=len(items), dropped=len(dropped),
+                uid=uid, status=1 if not gaps else (1 if items else 2))
+    return {'summary': {'gaps': items, 'coverage': cov, 'dropped': dropped},
+            'elapsed_ms': elapsed}
+
+
+def _load_na(db, req_id: int) -> Dict[str, str]:
+    """读人工标注的 NA 明细（决策②：理由必填已在写入时保证）"""
+    rows = db.execute_query('SELECT coverage_stat FROM ai_requirements WHERE id = %s', (req_id,))
+    if not rows:
+        return {}
+    try:
+        raw = rows[0].get('coverage_stat')
+        cov = json.loads(raw) if isinstance(raw, str) and raw else (raw or {})
+    except Exception:
+        return {}
+    na = cov.get('na') or {}
+    return {k: v for k, v in na.items() if v}
+
+
+@router.get('/requirement/stage/{name}')
+def requirement_stage(request: Request, requirement_id: int, name: str):
+    """查单阶段产物（前端切 Tab / 单阶段重跑后回读）"""
+    if name not in REQ_STAGES:
+        raise HTTPException(status_code=400, detail='未知阶段：%s' % name)
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT id, title, stage, stage_edited, coverage_stat, open_questions, '
+                'total_elapsed, analyse_result, model_id FROM ai_requirements '
+                'WHERE id = %s AND is_del = 0', (requirement_id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            r = rows[0]
+            payload = _load_payload(db, requirement_id, allow_legacy=True)
+            cov = r.get('coverage_stat')
+            try:
+                cov = json.loads(cov) if isinstance(cov, str) and cov else (cov or {})
+            except Exception:
+                cov = {}
+            if not cov:
+                cov = schema_mod.calc_coverage(
+                    (payload.get('extract') or {}).get('test_points') or [], {})
+            return _ok({
+                'requirement_id': requirement_id,
+                'title': r.get('title'),
+                'stage': r.get('stage'),
+                'stage_edited': bool(r.get('stage_edited')),
+                'stage_payload': payload,
+                'current': payload.get(name) or {},
+                'coverage_stat': cov,
+                'open_questions': schema_mod.collect_open_questions(payload),
+                'total_elapsed': r.get('total_elapsed') or 0,
+                'model_id': r.get('model_id'),
+                'legacy': bool((schema_mod.normalize_points(
+                    r.get('analyse_result')) or {}).get('legacy')),
+            })
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='读取阶段产物失败：%s' % e)
+
+
+@router.post('/requirement/stage/decompose/update')
+def requirement_stage_update(request: Request, data: ReqStageUpdateReq):
+    """决策⑥：人工修改阶段1 产物后回写，改完可重跑阶段2"""
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query('SELECT id, stage_payload FROM ai_requirements '
+                                    'WHERE id = %s AND is_del = 0', (data.requirement_id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            payload = _load_payload(db, data.requirement_id)
+            modules = []
+            for m in (data.modules or []):
+                if not isinstance(m, dict):
+                    continue
+                try:
+                    obj = schema_mod.ReqModule.model_validate(m)
+                except Exception:
+                    continue
+                modules.append(obj.model_dump())
+            if not modules:
+                raise HTTPException(status_code=400, detail='至少需要保留 1 个有效模块')
+            payload['decompose'] = {'modules': modules, 'edited': True,
+                                    'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            db.execute_update(
+                'UPDATE ai_requirements SET stage_payload = %s, stage_edited = 1 WHERE id = %s',
+                (json.dumps(payload, ensure_ascii=False, default=str), data.requirement_id))
+            return _ok({'modules': len(modules)}, '已保存阶段1 产物，可重跑阶段2 使用新内容')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='保存失败：%s' % e)
+
+
+class ReqExtractUpdateReq(BaseModel):
+    requirement_id: int
+    test_points: List[Dict[str, Any]] = Body(default_factory=list)
+
+
+@router.post('/requirement/stage/extract/update')
+def requirement_extract_update(request: Request, data: ReqExtractUpdateReq):
+    """阶段三 R11：人工修改阶段2 测试点后回写。
+
+    与阶段1 编辑同构：逐条过 StructuredTestPoint 校验（非法条目丢弃并回传条数），
+    保存后**重算覆盖率**（因为测试点的 dims 可能被改，覆盖率必须跟着变，
+    不能留着旧的 14/14 骗人）。
+    """
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query('SELECT id FROM ai_requirements '
+                                    'WHERE id = %s AND is_del = 0', (data.requirement_id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            payload = _load_payload(db, data.requirement_id)
+            points = []
+            skipped = 0
+            # 质量闸门：StructuredTestPoint 的字段全有默认值（为兼容模型漏字段），
+            # 所以 {bad:1} 会被「容错」成一条全空测试点。这里显式要求至少有标题+触发前置，
+            # 否则用户不小心保存就会把测试点清成空白列表。
+            empty_rows = 0
+            for t in (data.test_points or []):
+                if not isinstance(t, dict):
+                    skipped += 1
+                    continue
+                try:
+                    obj = schema_mod.StructuredTestPoint.model_validate(t)
+                except Exception:
+                    skipped += 1
+                    continue
+                d = obj.model_dump()
+                if not (d.get('title') or '').strip():
+                    empty_rows += 1
+                    continue
+                points.append(d)
+            skipped += empty_rows
+            if not points:
+                raise HTTPException(status_code=400, detail='至少需要保留 1 条有效测试点（每条必须有标题）')
+            cov = schema_mod.calc_coverage(points, _load_na(db, data.requirement_id))
+            # 覆盖率变了 → 阶段3 的缺口结论必然失效，必须清掉让它重跑，
+            # 否则页面会拿旧的「14/14 无缺口」骗人（这正是决策②要防的那类假数据）
+            audit_invalidated = bool(payload.get('audit'))
+            payload['audit'] = {}
+            payload['extract'] = {'test_points': points, 'coverage_stat': cov,
+                                  'edited': True,
+                                  'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            db.execute_update(
+                'UPDATE ai_requirements SET stage_payload = %s, stage_edited = 1 WHERE id = %s',
+                (json.dumps(payload, ensure_ascii=False, default=str), data.requirement_id))
+            _save_coverage(db, data.requirement_id, cov,
+                           schema_mod.collect_open_questions(payload))
+            msg = '已保存 %d 条测试点' % len(points)
+            if skipped:
+                msg += '（%d 条无效已丢弃）' % skipped
+            if audit_invalidated:
+                msg += '；覆盖审计结论已失效，请重跑阶段3'
+            return _ok({'test_points': len(points), 'skipped': skipped,
+                        'coverage_stat': cov,
+                        'audit_invalidated': audit_invalidated}, msg)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='保存失败：%s' % e)
+
+
+@router.post('/requirement/coverage/na')
+def requirement_mark_na(request: Request, data: ReqNaMarkReq):
+    """决策②：人工标「不适用」。reason 为空直接 400，防止刷覆盖率。"""
+    dims = [schema_mod.normalize_dims([d]) and (schema_mod.normalize_dims([d]) or [''])[0]
+            for d in (data.dims or [])]
+    dims = [d for d in dims if d in schema_mod.COVERAGE_DIMS]
+    if not dims:
+        raise HTTPException(status_code=400, detail='请选择要标记的覆盖维度')
+    if not (data.reason or '').strip():
+        raise HTTPException(status_code=400, detail='必须填写不适用理由，否则覆盖率可被刷分')
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query('SELECT id FROM ai_requirements WHERE id = %s AND is_del = 0',
+                                    (data.requirement_id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            payload = _load_payload(db, data.requirement_id)
+            tps = (payload.get('extract') or {}).get('test_points') or []
+            cov_old = _load_cov(db, data.requirement_id)
+            na = dict(cov_old.get('na') or {})
+            for d in dims:
+                na[d] = data.reason.strip()
+            cov = schema_mod.calc_coverage(tps, na)
+            payload.setdefault('audit', {})['coverage_stat'] = cov
+            db.execute_update(
+                'UPDATE ai_requirements SET stage_payload = %s, coverage_stat = %s WHERE id = %s',
+                (json.dumps(payload, ensure_ascii=False, default=str),
+                 json.dumps(cov, ensure_ascii=False, default=str), data.requirement_id))
+            msg = '已标记 %d 个维度为不适用' % len(dims)
+            if cov.get('na_warning'):
+                msg += '；⚠️ 不适用已超过半数，覆盖率参考性下降，请确认是否误标'
+            return _ok({'coverage_stat': cov, 'na': na}, msg)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='标记失败：%s' % e)
+
+
+@router.post('/requirement/coverage/na/reset')
+def requirement_reset_na(request: Request, requirement_id: int = Body(..., embed=True)):
+    """取消人工标注的 NA（恢复为默认口径）"""
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query('SELECT id FROM ai_requirements WHERE id = %s AND is_del = 0',
+                                    (requirement_id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            payload = _load_payload(db, requirement_id)
+            tps = (payload.get('extract') or {}).get('test_points') or []
+            cov = schema_mod.calc_coverage(tps, {})
+            payload.setdefault('audit', {})['coverage_stat'] = cov
+            db.execute_update(
+                'UPDATE ai_requirements SET stage_payload = %s, coverage_stat = %s WHERE id = %s',
+                (json.dumps(payload, ensure_ascii=False, default=str),
+                 json.dumps(cov, ensure_ascii=False, default=str), requirement_id))
+            return _ok({'coverage_stat': cov}, '已清除不适用标注')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='重置失败：%s' % e)
+
+
+def _load_cov(db, req_id: int) -> Dict[str, Any]:
+    rows = db.execute_query('SELECT coverage_stat FROM ai_requirements WHERE id = %s', (req_id,))
+    if not rows:
+        return {}
+    raw = rows[0].get('coverage_stat')
+    try:
+        return json.loads(raw) if isinstance(raw, str) and raw else (raw or {})
+    except Exception:
+        return {}
+
+
+@router.get('/requirement/open-questions')
+def requirement_open_questions(request: Request, requirement_id: int):
+    """所有 [待确认]+[经验假设]，供一键导出给产品经理反向对齐"""
+    try:
+        with get_db_handler() as db:
+            payload = _load_payload(db, requirement_id, allow_legacy=True)
+            items = schema_mod.collect_open_questions(payload)
+            rows = db.execute_query('SELECT title FROM ai_requirements WHERE id = %s',
+                                    (requirement_id,))
+            return _ok({
+                'requirement_id': requirement_id,
+                'title': rows[0].get('title') if rows else '',
+                'count': len(items),
+                'items': items,
+                'assumption_count': len([x for x in items
+                                         if x.get('evidence_type') == 'assumption']),
+                'pending_count': len([x for x in items
+                                      if x.get('evidence_type') == 'pending']),
+            }, '共 %d 条待产品确认' % len(items))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='读取待确认清单失败：%s' % e)
+
+
+@router.get('/requirement/stage-runs')
+def requirement_stage_runs(request: Request, requirement_id: int):
+    """三阶段执行留痕（含 tokens/elapsed），供报告与排查用"""
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT stage, status, blocks_total, blocks_done, item_count, dropped_count, '
+                'total_tokens, elapsed_ms, error_msg, create_time FROM ai_req_stage_runs '
+                'WHERE requirement_id = %s ORDER BY id DESC LIMIT 30', (requirement_id,))
+            return _ok({'runs': rows})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='读取执行记录失败：%s' % e)
+
+
+@router.get('/requirement/detail')
+def requirement_detail(request: Request, id: int):
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT id, title, req_type, content_text, analyse_result, status, error_msg, create_time '
+                'FROM ai_requirements WHERE id = %s AND is_del = 0', (id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='需求文档不存在')
+            row = rows[0]
+            row['analyse_result'] = _json_loads(row.get('analyse_result'), None)
+            return _ok(row)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询详情失败：%s' % e)
+
+
+# ===========================================================================
+# 七-3、任务测试总结（F3b，支持无实际结果的降级模式）
+# ===========================================================================
+_STATUS_MAP = {0: '未开始', 1: '待执行', 2: '通过', 3: '失败', 4: '跳过'}
+
+
+class TaskSummaryReq(BaseModel):
+    task_id: int
+    model_id: Optional[int] = None
+
+
+@router.post('/task-summary')
+def task_summary(request: Request, data: TaskSummaryReq):
+    """基于 task_management + task_detail 输出测试结论；无 final_result 走降级推断模式"""
+    try:
+        uid = _uid(request)
+        # AI 在途锁：登记，若已存在同类任务则拒绝重复提交（刷新/切页后仍可判定在途）
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'task_summary', uid):
+                raise HTTPException(status_code=409, detail='已有「任务测试总结」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            t = db.execute_query(
+                'SELECT id, task_name, priority, task_status, begin_time, end_time, '
+                'passed_nums, failed_nums, completed_nums, tc_nums '
+                'FROM task_management WHERE id = %s', (data.task_id,))
+            if not t:
+                raise HTTPException(status_code=404, detail='任务不存在')
+            task = t[0]
+            details = db.execute_query(
+                'SELECT id, project, module, function_point, priority, pre_condition, steps, '
+                'expected_result, final_result, remark, case_status '
+                'FROM task_detail WHERE task_id = %s ORDER BY id DESC LIMIT 100', (data.task_id,))
+            details = details or []
+            has_actual = any((d.get('final_result') or '').strip() for d in details)
+            mode = ('A（有实测实际结果）' if has_actual
+                    else 'B（降级·无实际结果，仅依据标题/步骤/状态推断，结论低置信度）')
+
+            detail_lines = []
+            for d in details:
+                detail_lines.append(
+                    '#用例 %s [%s] %s / %s / %s\n前置：%s\n步骤：%s\n预期：%s\n实际结果：%s\n备注：%s'
+                    % (d['id'], _STATUS_MAP.get(d.get('case_status'), '未知'),
+                       d.get('project') or '', d.get('module') or '', d.get('function_point') or '',
+                       _clip(d.get('pre_condition'), 120), _clip(d.get('steps'), 300),
+                       _clip(d.get('expected_result'), 200),
+                       _clip(d.get('final_result'), 200) or '（未填写）',
+                       _clip(d.get('remark'), 100)))
+            task_text = ('任务：%s\n优先级：%s\n状态：%s\n计划开始：%s 结束：%s\n'
+                         '用例总数：%s 完成：%s 通过：%s 失败：%s'
+                         % (task.get('task_name'), task.get('priority'), task.get('task_status'),
+                            task.get('begin_time'), task.get('end_time'),
+                            task.get('tc_nums'), task.get('completed_nums'),
+                            task.get('passed_nums'), task.get('failed_nums')))
+
+            result = runner.run_text(
+                db, uid, biz_type='task_summary', prompt_code='task_summary',
+                prompt_vars={'mode': mode, 'task_text': task_text,
+                             'detail_text': '\n\n'.join(detail_lines)},
+                model_id=data.model_id)
+            title = '任务测试总结 #%s（%s）' % (task['id'], task.get('task_name'))
+            report_id = _insert_id(
+                db,
+                'INSERT INTO ai_reports (report_type, title, biz_type, biz_id, content_md, summary_json, '
+                'model_id, run_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                ('task_summary', title, 'task', str(task['id']),
+                 result['data'].get('text') or '',
+                 json.dumps({'task_id': task['id'], 'mode': mode, 'has_actual': has_actual,
+                             'detail_count': len(details), 'elapsed_ms': result['elapsed_ms'],
+                             'masked_count': result['masked_count']}, ensure_ascii=False, default=str),
+                 result['model']['id'], uid))
+            return _ok({
+                'report_id': report_id, 'title': title,
+                'content_md': result['data'].get('text') or '', 'mode': mode,
+                'has_actual': has_actual, 'detail_count': len(details),
+                'model': result['model'], 'usage': result['usage'],
+                'elapsed_ms': result['elapsed_ms'], 'masked_count': result['masked_count'],
+            }, '总结已生成')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='生成任务总结失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'task_summary', uid)
+
+
+# ===========================================================================
+# 八、调用日志 / 报告 / 设置 / 概览
+# ===========================================================================
+@router.get('/logs')
+def list_logs(request: Request, pageNo: int = 1, pageSize: int = 20,
+                    biz_type: str = '', success: Optional[int] = None, mine: int = 0):
+    try:
+        uid = _uid(request)
+        where = ['1=1']
+        args: List[Any] = []
+        if biz_type:
+            where.append('l.biz_type = %s')
+            args.append(biz_type)
+        if success is not None and str(success) != '':
+            where.append('l.success = %s')
+            args.append(int(success))
+        if mine:
+            where.append('l.run_by = %s')
+            args.append(uid)
+        cond = ' AND '.join(where)
+        with get_db_handler() as db:
+            rows = db.execute_query('SELECT COUNT(*) AS n FROM ai_logs l WHERE %s' % cond, tuple(args))
+            total = rows[0]['n'] if rows else 0
+            pageNo = max(1, int(pageNo))
+            pageSize = max(1, int(pageSize)) if pageSize and int(pageSize) > 0 else 20
+            items = db.execute_query(
+                'SELECT l.*, u.username AS run_by_name FROM ai_logs l '
+                'LEFT JOIN users u ON u.id = l.run_by WHERE %s '
+                'ORDER BY l.id DESC LIMIT %%s OFFSET %%s' % cond,
+                tuple(args) + (pageSize, (pageNo - 1) * pageSize))
+            return _ok({'list': items or [], 'total': total, 'pageNo': pageNo, 'pageSize': pageSize})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询日志失败：%s' % e)
+
+
+@router.get('/logs/stat')
+def logs_stat(request: Request, days: int = 7):
+    try:
+        days = max(1, min(int(days or 7), 90))
+        since = datetime.now() - timedelta(days=days)
+        with get_db_handler() as db:
+            summary = db.execute_query(
+                'SELECT COUNT(*) AS calls, SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS ok, '
+                'SUM(IFNULL(total_tokens, 0)) AS tokens, '
+                'ROUND(AVG(elapsed_ms), 0) AS avg_ms, MAX(elapsed_ms) AS max_ms '
+                'FROM ai_logs WHERE create_time >= %s', (since,))
+            by_model = db.execute_query(
+                'SELECT model_name, COUNT(*) AS calls, SUM(IFNULL(total_tokens,0)) AS tokens, '
+                'SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS ok '
+                'FROM ai_logs WHERE create_time >= %s GROUP BY model_name ORDER BY calls DESC', (since,))
+            by_biz = db.execute_query(
+                'SELECT biz_type, COUNT(*) AS calls, SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS ok '
+                'FROM ai_logs WHERE create_time >= %s GROUP BY biz_type ORDER BY calls DESC', (since,))
+            by_user = db.execute_query(
+                'SELECT l.run_by, u.username, COUNT(*) AS calls, '
+                'SUM(IFNULL(l.total_tokens,0)) AS tokens '
+                'FROM ai_logs l LEFT JOIN users u ON u.id = l.run_by WHERE l.create_time >= %s '
+                'GROUP BY l.run_by, u.username ORDER BY calls DESC LIMIT 20', (since,))
+            s = summary[0] if summary else {}
+            calls = int(s.get('calls') or 0)
+            ok = int(s.get('ok') or 0)
+            return _ok({
+                'days': days,
+                'summary': {
+                    'calls': calls, 'success': ok, 'failed': calls - ok,
+                    'success_rate': round(ok * 100.0 / calls, 1) if calls else 0.0,
+                    'tokens': int(s.get('tokens') or 0),
+                    'avg_ms': int(s.get('avg_ms') or 0), 'max_ms': int(s.get('max_ms') or 0),
+                },
+                'by_model': by_model or [],
+                'by_biz': by_biz or [],
+                'by_user': by_user or [],
+            })
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='统计失败：%s' % e)
+
+
+@router.get('/reports')
+def list_reports(request: Request, pageNo: int = 1, pageSize: int = 20,
+                       report_type: str = '', days: int = 30):
+    try:
+        since = datetime.now() - timedelta(days=max(1, min(int(days or 30), 365)))
+        where = ['r.is_del = 0', 'r.create_time >= %s']
+        args: List[Any] = [since]
+        if report_type:
+            where.append('r.report_type = %s')
+            args.append(report_type)
+        cond = ' AND '.join(where)
+        with get_db_handler() as db:
+            rows = db.execute_query('SELECT COUNT(*) AS n FROM ai_reports r WHERE %s' % cond, tuple(args))
+            total = rows[0]['n'] if rows else 0
+            pageNo = max(1, int(pageNo))
+            pageSize = max(1, int(pageSize)) if pageSize and int(pageSize) > 0 else 20
+            items = db.execute_query(
+                'SELECT r.id, r.report_type, r.title, r.biz_type, r.biz_id, r.summary_json, r.model_id, '
+                'r.run_by, r.create_time, u.username AS run_by_name, m.name AS model_name '
+                'FROM ai_reports r LEFT JOIN users u ON u.id = r.run_by '
+                'LEFT JOIN ai_models m ON m.id = r.model_id '
+                'WHERE %s ORDER BY r.id DESC LIMIT %%s OFFSET %%s' % cond,
+                tuple(args) + (pageSize, (pageNo - 1) * pageSize))
+            for it in items or []:
+                it['summary_json'] = _json_loads(it.get('summary_json'), None)
+            return _ok({'list': items or [], 'total': total, 'pageNo': pageNo, 'pageSize': pageSize})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询报告失败：%s' % e)
+
+
+@router.get('/reports/detail')
+def report_detail(request: Request, id: int):
+    try:
+        with get_db_handler() as db:
+            rows = db.execute_query(
+                'SELECT r.*, u.username AS run_by_name, m.name AS model_name FROM ai_reports r '
+                'LEFT JOIN users u ON u.id = r.run_by LEFT JOIN ai_models m ON m.id = r.model_id '
+                'WHERE r.id = %s AND r.is_del = 0', (id,))
+            if not rows:
+                raise HTTPException(status_code=404, detail='报告不存在')
+            row = rows[0]
+            row['summary_json'] = _json_loads(row.get('summary_json'), None)
+            return _ok(row)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询报告详情失败：%s' % e)
+
+
+@router.get('/settings')
+def get_ai_settings(request: Request):
+    try:
+        with get_db_handler() as db:
+            cfg = settings_mod.load(db, force=True)
+            return _ok({
+                'per_call_max_tokens': int(cfg.get('per_call_max_tokens') or 4096),
+                'daily_call_limit': int(cfg.get('daily_call_limit') or 200),
+                'ai_mask_enabled': cfg.get('ai_mask_enabled', '1'),
+                'ai_mask_refill': cfg.get('ai_mask_refill', '0'),
+                'ai_mask_rules': cfg.get('ai_mask_rules') or '',
+                'can_edit': _has_perm(db, _uid(request), 'menu:ai:setting'),
+            })
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='读取设置失败：%s' % e)
+
+
+class SettingsSave(BaseModel):
+    per_call_max_tokens: Optional[int] = None
+    daily_call_limit: Optional[int] = None
+    ai_mask_enabled: Optional[int] = None
+    ai_mask_refill: Optional[int] = None
+    ai_mask_rules: Optional[str] = None
+
+
+@router.put('/settings')
+def save_ai_settings(request: Request, data: SettingsSave):
+    try:
+        uid = _uid(request)
+        with get_db_handler() as db:
+            if not _has_perm(db, uid, 'menu:ai:setting'):
+                raise HTTPException(status_code=403, detail='无权修改 AI 配额与脱敏设置')
+            payload = data.model_dump(exclude_none=True)
+            if 'ai_mask_rules' in payload and payload['ai_mask_rules']:
+                # 提前校验正则，避免脏规则让脱敏静默失效
+                try:
+                    json.loads(payload['ai_mask_rules'])
+                except Exception:
+                    raise HTTPException(status_code=400, detail='自定义脱敏规则必须是合法 JSON 数组')
+            for k, v in payload.items():
+                settings_mod.set_value(db, k, v, uid)
+            return _ok(None, '设置已保存')
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='保存设置失败：%s' % e)
+
+
+@router.get('/overview')
+def overview(request: Request):
+    """AI 工作台首页概览：模型、今日用量、草稿池、最近报告"""
+    try:
+        uid = _uid(request)
+        with get_db_handler() as db:
+            models = model_reg.list_models(db, uid)
+            enabled = [m for m in models if m.get('enabled')]
+            default_model = next((m for m in enabled
+                                  if m.get('is_default') and (m.get('owner_user_id') or 0) == uid), None)
+            if default_model is None:
+                default_model = next((m for m in enabled
+                                      if m.get('is_default') and (m.get('owner_user_id') or 0) == 0), None)
+            today = db.execute_query(
+                'SELECT COUNT(*) AS calls, SUM(IFNULL(total_tokens,0)) AS tokens, '
+                'SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS ok '
+                'FROM ai_logs WHERE run_by = %s AND create_time >= CURDATE()', (uid,))
+            drafts = db.execute_query(
+                'SELECT status, COUNT(*) AS n FROM ai_case_drafts GROUP BY status')
+            stat = {0: 0, 1: 0, 2: 0}
+            for r in drafts or []:
+                stat[int(r['status'])] = r['n']
+            reports = db.execute_query(
+                'SELECT id, report_type, title, create_time FROM ai_reports WHERE is_del = 0 '
+                'ORDER BY id DESC LIMIT 5')
+            t = today[0] if today else {}
+            limit = settings_mod.get_int(db, 'daily_call_limit', 200)
+            used = int(t.get('calls') or 0)
+            return _ok({
+                'models': {'total': len(models), 'enabled': len(enabled),
+                           'default': (default_model or {}).get('name') if default_model else None,
+                           'default_type': (default_model or {}).get('model_type') if default_model else None,
+                           'is_personal_default': bool(default_model
+                                                       and (default_model.get('owner_user_id') or 0) == uid)},
+                'today': {'calls': used, 'tokens': int(t.get('tokens') or 0),
+                          'success': int(t.get('ok') or 0),
+                          'quota': limit, 'remaining': max(0, limit - used) if limit > 0 else -1},
+                'drafts': {'draft': stat[0], 'adopted': stat[1], 'discarded': stat[2],
+                           'total': sum(stat.values())},
+                'recent_reports': reports or [],
+            })
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='查询概览失败：%s' % e)
+
+
+# ===========================================================================
+# 九、三期功能：用例↔接口互转 / 测试数据 / 覆盖度 / 多模型评测 / 调试台
+# ===========================================================================
+def _dump_json(value) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+# ---- F7 测试数据生成 ----
+class DataGenReq(BaseModel):
+    rules: List[Dict[str, Any]] = []
+    count: int = 8
+    model_id: Optional[int] = None
+
+
+@router.post('/data-gen')
+def data_gen(request: Request, data: DataGenReq):
+    try:
+        uid = _uid(request)
+        if not data.rules:
+            raise HTTPException(status_code=400, detail='请先定义字段规则')
+        count = max(1, min(int(data.count or 8), 30))
+        rules_text = '\n'.join(
+            '- %s（类型：%s；约束：%s；示例：%s）' % (r.get('name'), r.get('type'), r.get('constraint'), r.get('example'))
+            for r in data.rules)
+        # AI 在途锁：登记，若已存在同类任务则拒绝重复提交（刷新/切页后仍可判定在途）
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'data_gen', uid):
+                raise HTTPException(status_code=409, detail='已有「测试数据生成」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            result = runner.run_structured(
+                db, uid, biz_type='data_gen', prompt_code='data_gen',
+                prompt_vars={'rules_text': rules_text, 'count': count},
+                list_key='rows', item_model=schema_mod.DataGenRow, model_id=data.model_id)
+            rows = [r for r in result['items']]
+            title = '测试数据生成（%d 行 / %d 字段）' % (len(rows), len(data.rules))
+            report_id = _insert_id(
+                db,
+                'INSERT INTO ai_reports (report_type, title, biz_type, biz_id, content_md, summary_json, '
+                'model_id, run_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                ('data_gen', title, 'data', str(count), _dump_json(rows),
+                 json.dumps({'rows': len(rows), 'fields': len(data.rules),
+                             'elapsed_ms': result['elapsed_ms'],
+                             'masked_count': result['masked_count']}, ensure_ascii=False),
+                 result['model']['id'], uid))
+            return _ok({'report_id': report_id, 'title': title, 'rows': rows,
+                        'dropped': result['dropped'], 'model': result['model'],
+                        'usage': result['usage'], 'elapsed_ms': result['elapsed_ms']}, '已生成测试数据')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='生成测试数据失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'data_gen', uid)
+
+
+class DataSetCommitReq(BaseModel):
+    interface_id: int
+    rows: List[Dict[str, Any]] = []
+
+
+@router.post('/dataset/commit')
+def dataset_commit(request: Request, data: DataSetCommitReq):
+    """把生成的数据集写入指定接口的数据驱动字段"""
+    try:
+        with get_db_handler() as db:
+            db.execute_update('UPDATE api_interfaces SET dataset = %s, update_time = NOW() WHERE id = %s',
+                              (_dump_json(data.rows), data.interface_id))
+        return _ok(None, '已写入 %d 行数据集' % len(data.rows))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='写入数据集失败：%s' % e)
+
+
+# ---- F8 需求覆盖度矩阵 ----
+class CoverageReq(BaseModel):
+    requirement_text: str = ''
+    project_id: Optional[int] = None
+    cases_text: str = ''
+    model_id: Optional[int] = None
+
+
+@router.post('/coverage')
+def coverage(request: Request, data: CoverageReq):
+    try:
+        uid = _uid(request)
+        # AI 在途锁：同一用户覆盖度分析期间拒绝重复提交（刷新/切页后仍可判定在途）
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'coverage', uid):
+                raise HTTPException(status_code=409, detail='已有「覆盖度分析」任务在运行中，请稍候')
+        with get_db_handler() as db:
+            if data.project_id:
+                cases = db.execute_query(
+                    'SELECT module, function_point, steps FROM test_cases '
+                    'WHERE is_del = 0 AND project_id = %s ORDER BY id DESC LIMIT 100', (data.project_id,))
+                cases_text = data.cases_text or '\n'.join(
+                    '【%s/%s】%s' % (c.get('module'), c.get('function_point'), _clip(c.get('steps'), 200))
+                    for c in cases)
+            else:
+                cases_text = data.cases_text
+            if not (data.requirement_text or '').strip():
+                raise HTTPException(status_code=400, detail='请填写需求功能点清单')
+            if not (cases_text or '').strip():
+                raise HTTPException(status_code=400, detail='请选择项目或粘贴已有用例')
+            result = runner.run_structured(
+                db, uid, biz_type='coverage', prompt_code='coverage',
+                prompt_vars={'requirements_text': data.requirement_text, 'cases_text': cases_text},
+                list_key='coverage', item_model=schema_mod.CoverageItem, model_id=data.model_id)
+            items = result['items']
+            missing = sum(1 for it in items if it.get('missing'))
+            title = '覆盖度分析（%d 个需求点，%d 个缺口）' % (len(items), missing)
+            report_id = _insert_id(
+                db,
+                'INSERT INTO ai_reports (report_type, title, biz_type, biz_id, content_md, summary_json, '
+                'model_id, run_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                ('coverage', title, 'project', str(data.project_id or 0), _dump_json(items),
+                 json.dumps({'points': len(items), 'missing': missing,
+                             'elapsed_ms': result['elapsed_ms'],
+                             'masked_count': result['masked_count']}, ensure_ascii=False),
+                 result['model']['id'], uid))
+            return _ok({'report_id': report_id, 'title': title, 'coverage': items,
+                        'missing': missing, 'model': result['model'],
+                        'usage': result['usage'], 'elapsed_ms': result['elapsed_ms']}, '覆盖度分析完成')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='覆盖度分析失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'coverage', uid)
+
+
+# ---- F16 Prompt 调试台 ----
+class PromptRunReq(BaseModel):
+    model_id: Optional[int] = None
+    system: str = ''
+    user: str = ''
+    structured: bool = False
+    schema_text: str = ''
+    vars: Dict[str, Any] = {}
+
+
+@router.post('/prompt/run')
+def prompt_run(request: Request, data: PromptRunReq):
+    try:
+        uid = _uid(request)
+        if not (data.user or '').strip():
+            raise HTTPException(status_code=400, detail='请填写用户提示词')
+        user_msg = data.user
+        if data.structured and data.schema_text:
+            user_msg += '\n\n请只输出一个合法 JSON 对象，不要解释文字、不要 markdown 包裹：\n' + data.schema_text
+        override = {'system': data.system or '', 'user': user_msg, 'output_schema': None}
+        # AI 在途锁：调试运行拒绝重复提交（刷新/切页后仍可判定在途）
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'prompt_run', uid):
+                raise HTTPException(status_code=409, detail='调试运行正在处理中，请稍候')
+        with get_db_handler() as db:
+            res = runner.run_text(
+                db, uid, biz_type='prompt_run', prompt_code='__run__',
+                prompt_vars=data.vars or {}, model_id=data.model_id, prompt_override=override)
+        return _ok({
+            'output': res['data'].get('text') or '', 'model': res['model'],
+            'usage': res['usage'], 'elapsed_ms': res['elapsed_ms'],
+            'attempt': res['attempt'], 'dropped': res.get('dropped'),
+            'masked_count': res.get('masked_count'),
+        }, '运行完成')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='调试运行失败：%s' % e)
+
+
+# ===========================================================================
+# 九、四期：成本看板（F15）/ 缺陷聚类（F9）/ 周报（F10）/ 上下文助手（F11）
+# ===========================================================================
+def _is_local_url(url: str) -> bool:
+    """本地模型（Ollama / vLLM）常无鉴权，识别为本地地址即允许空 key"""
+    if not url:
+        return False
+    return any(seg in url for seg in ('localhost', '127.0.0.1', '0.0.0.0', '::1'))
+
+
+@router.get('/cost')
+def cost_stat(request: Request, days: int = 7):
+    """F15 AI 用量与成本看板：按模型 / 功能 / 用户聚合 token、费用、成功率、P95 耗时 + 每日趋势"""
+    try:
+        days = max(1, min(int(days or 7), 90))
+        since = datetime.now() - timedelta(days=days)
+        with get_db_handler() as db:
+            summary = db.execute_query(
+                'SELECT COUNT(*) AS calls, '
+                'SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS ok, '
+                'SUM(IFNULL(total_tokens,0)) AS tokens, '
+                'ROUND(AVG(elapsed_ms),0) AS avg_ms, MAX(elapsed_ms) AS max_ms '
+                'FROM ai_logs WHERE create_time >= %s', (since,))
+            p95 = db.execute_query(
+                'SELECT ROUND(AVG(elapsed_ms),0) AS p95 FROM ('
+                'SELECT elapsed_ms, ROW_NUMBER() OVER (ORDER BY elapsed_ms) rn, '
+                'COUNT(*) OVER () c FROM ai_logs WHERE create_time >= %s AND elapsed_ms > 0) t '
+                'WHERE rn >= c*0.95', (since,))
+            by_model = db.execute_query(
+                'SELECT l.model_name, COUNT(*) AS calls, SUM(IFNULL(l.total_tokens,0)) AS tokens, '
+                'SUM(CASE WHEN l.success=1 THEN 1 ELSE 0 END) AS ok, '
+                'COALESCE(m.cost_per_1k,0) AS cost_per_1k '
+                'FROM ai_logs l LEFT JOIN ai_models m ON m.id = l.model_id '
+                'WHERE l.create_time >= %s GROUP BY l.model_name, m.cost_per_1k '
+                'ORDER BY tokens DESC', (since,))
+            by_biz = db.execute_query(
+                'SELECT biz_type, COUNT(*) AS calls, SUM(IFNULL(total_tokens,0)) AS tokens, '
+                'SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS ok '
+                'FROM ai_logs WHERE create_time >= %s GROUP BY biz_type ORDER BY calls DESC', (since,))
+            by_user = db.execute_query(
+                'SELECT l.run_by, u.username, COUNT(*) AS calls, SUM(IFNULL(l.total_tokens,0)) AS tokens '
+                'FROM ai_logs l LEFT JOIN users u ON u.id = l.run_by '
+                'WHERE l.create_time >= %s GROUP BY l.run_by, u.username ORDER BY calls DESC LIMIT 20', (since,))
+            daily = db.execute_query(
+                'SELECT DATE(create_time) AS day, COUNT(*) AS calls, SUM(IFNULL(total_tokens,0)) AS tokens '
+                'FROM ai_logs WHERE create_time >= %s GROUP BY DATE(create_time) ORDER BY day', (since,))
+
+            s = summary[0] if summary else {}
+            calls = int(s.get('calls') or 0)
+            ok = int(s.get('ok') or 0)
+            total_tokens = int(s.get('tokens') or 0)
+            cost_total = 0.0
+            models_out = []
+            for m in (by_model or []):
+                tok = int(m.get('tokens') or 0)
+                price = float(m.get('cost_per_1k') or 0)
+                cost = round(tok / 1000.0 * price, 4) if price else 0.0
+                cost_total += cost
+                c = int(m.get('calls') or 0)
+                models_out.append({
+                    'model_name': m.get('model_name') or '未知模型', 'calls': c, 'tokens': tok,
+                    'success': int(m.get('ok') or 0),
+                    'success_rate': round(int(m.get('ok') or 0) * 100.0 / max(c, 1), 1),
+                    'cost_per_1k': price, 'cost': cost,
+                })
+            for b in (by_biz or []):
+                c = int(b.get('calls') or 0)
+                b['success_rate'] = round(int(b.get('ok') or 0) * 100.0 / max(c, 1), 1)
+            for u in (by_user or []):
+                u['username'] = u.get('username') or ('用户#%s' % u.get('run_by'))
+            return _ok({
+                'days': days,
+                'summary': {
+                    'calls': calls, 'success': ok, 'failed': calls - ok,
+                    'success_rate': round(ok * 100.0 / calls, 1) if calls else 0.0,
+                    'tokens': total_tokens, 'cost': round(cost_total, 4),
+                    'avg_ms': int(s.get('avg_ms') or 0), 'max_ms': int(s.get('max_ms') or 0),
+                    'p95_ms': int((p95[0].get('p95') if p95 else 0) or 0),
+                },
+                'by_model': models_out, 'by_biz': by_biz or [],
+                'by_user': by_user or [], 'daily': daily or [],
+            })
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='成本统计失败：%s' % e)
+
+
+class WeeklyReportReq(BaseModel):
+    start: str
+    end: str
+    model_id: Optional[int] = None
+
+
+@router.post('/weekly-report')
+def weekly_report(request: Request, data: WeeklyReportReq):
+    """F10 周报/日报自动生成：接口 + 任务 + 用例三线数据 → AI 生成 Markdown 周报"""
+    try:
+        uid = _uid(request)
+        start = (data.start or '')[:10]
+        end = (data.end or '')[:10]
+        if not start or not end:
+            raise HTTPException(status_code=400, detail='请选择开始与结束日期')
+        with get_db_handler() as db:
+            end_ts = end + ' 23:59:59'
+            exec_stat = db.execute_query(
+                'SELECT COUNT(*) AS n, SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS ok, '
+                'SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS fail '
+                'FROM api_executions WHERE run_time >= %s AND run_time <= %s', (start, end_ts))
+            task_stat = db.execute_query(
+                'SELECT COUNT(*) AS n, SUM(CASE WHEN task_status=4 THEN 1 ELSE 0 END) AS done '
+                'FROM task_management WHERE create_time >= %s AND create_time <= %s', (start, end_ts))
+            case_stat = db.execute_query(
+                'SELECT COUNT(*) AS n, SUM(CASE WHEN ai_generated=1 THEN 1 ELSE 0 END) AS ai '
+                'FROM test_cases WHERE create_time >= %s AND create_time <= %s', (start, end_ts))
+            es = exec_stat[0] if exec_stat else {}
+            ts = task_stat[0] if task_stat else {}
+            cs = case_stat[0] if case_stat else {}
+            brief = (
+                '【接口自动化】区间执行 %d 次，通过 %d，失败 %d。\n'
+                '【测试任务】区间新建任务 %d 个，已完成 %d 个。\n'
+                '【测试用例】区间新增用例 %d 条，其中 AI 生成 %d 条。\n'
+                % (int(es.get('n') or 0), int(es.get('ok') or 0), int(es.get('fail') or 0),
+                   int(ts.get('n') or 0), int(ts.get('done') or 0),
+                   int(cs.get('n') or 0), int(cs.get('ai') or 0))
+            )
+            result = runner.run_text(
+                db, uid, biz_type='weekly_report', prompt_code='weekly_report',
+                prompt_vars={'range_text': '%s ~ %s' % (start, end), 'brief': brief},
+                model_id=data.model_id)
+            md = result['data'].get('text') or ''
+            title = '测试周报（%s ~ %s）' % (start, end)
+            report_id = _insert_id(
+                db,
+                'INSERT INTO ai_reports (report_type, title, biz_type, biz_id, content_md, summary_json, '
+                'model_id, run_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                ('weekly', title, 'week', '%s~%s' % (start, end), md,
+                 json.dumps({'brief': brief, 'elapsed_ms': result['elapsed_ms']}, ensure_ascii=False, default=str),
+                 result['model']['id'], uid))
+            return _ok({
+                'report_id': report_id, 'title': title, 'content_md': md,
+                'model': result['model'], 'usage': result['usage'],
+                'elapsed_ms': result['elapsed_ms'],
+            }, '周报已生成')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='生成周报失败：%s' % e)
+    finally:
+        with get_db_handler() as _lk:
+            inflight_clear(_lk, 'weekly_report', uid)
+
+
+class AssistantReq(BaseModel):
+    context: str = ''
+    message: str
+    model_id: Optional[int] = None
+
+
+@router.post('/assistant')
+def assistant_chat(request: Request, data: AssistantReq):
+    """F11 上下文感知助手：结合当前页/任务/批次上下文回答用户问题"""
+    try:
+        uid = _uid(request)
+        if not (data.message or '').strip():
+            raise HTTPException(status_code=400, detail='请输入消息')
+        # AI 在途锁：助手回复拒绝重复提交（刷新/切页后仍可判定在途）
+        with get_db_handler() as _lk:
+            if not inflight_mark(_lk, 'assistant', uid):
+                raise HTTPException(status_code=409, detail='助手正在回复中，请稍候')
+        with get_db_handler() as db:
+            result = runner.run_text(
+                db, uid, biz_type='assistant', prompt_code='assistant',
+                prompt_vars={
+                    'assistant_context': (data.context or '（无附加上下文）')[:4000],
+                    'user_message': data.message[:4000],
+                },
+                model_id=data.model_id)
+            return _ok({
+                'text': result['data'].get('text') or '',
+                'model': result['model'], 'usage': result['usage'],
+                'elapsed_ms': result['elapsed_ms'],
+            }, 'ok')
+    except HTTPException:
+        raise
+    except AIError as e:
+        _raise_ai(e)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail='助手回复失败：%s' % e)
