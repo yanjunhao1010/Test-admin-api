@@ -31,7 +31,7 @@ from fastapi.security import APIKeyHeader  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
-from routers import testcases, AIS, taskcases, users, uploadfiles, rbac, menus, auth, defects, automation, ai_workbench, home, notifications, system, departments, travel, kb, devprocess, product_points  # noqa: E402
+from routers import testcases, AIS, taskcases, users, uploadfiles, rbac, menus, auth, defects, automation, ai_workbench, home, notifications, system, departments, travel, kb, devprocess, product_points, code_watch  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ app = FastAPI(lifespan=lifespan)
 api_key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
 EXPECTED_API_KEY = os.getenv('API_KEY', '')
 
-
+###测试一下上传代码
 async def verify_api_key(request: Request) -> None:
     if not EXPECTED_API_KEY:
         return
@@ -158,6 +158,8 @@ app.include_router(travel.router, prefix='/api', dependencies=[Depends(verify_ap
 # 研发流程可视化（智能流程看板）+ 需求变更影响分析
 app.include_router(devprocess.router, prefix='/api', dependencies=[Depends(verify_api_key)])
 app.include_router(product_points.router, prefix='/api', dependencies=[Depends(verify_api_key)])
+# 代码变更影响分析：监听 dev 分支 → 静态分析影响面 → 输出回归范围与建议（只读，不执行用例）
+app.include_router(code_watch.router, prefix='/api', dependencies=[Depends(verify_api_key)])
 # 允许跨域的前端来源：通过环境变量 CORS_ORIGINS 配置（英文逗号分隔）。
 # 未配置时回退到本地开发地址，保证本地开发体验不变。
 CORS_ORIGINS = [
