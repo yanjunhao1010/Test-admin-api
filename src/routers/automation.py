@@ -3059,13 +3059,35 @@ async def interface_import_template():
 # 环境管理（base_url 抽离，多环境切换）
 # ---------------------------------------------------------------------------
 @router.get('/environments')
-async def list_environments():
+async def list_environments(request: Request):
     try:
         with get_db_handler() as db:
+            where = '1=1'
+            params = []
+            # 数据权限（与 /interfaces、taskcases/defects 一致）：超管(角色含 admin)查看全部，
+            # 普通用户仅看自己创建的环境（create_by = 当前用户 id）。
+            token = request.headers.get('accessToken')
+            if token:
+                try:
+                    uid = parse_token(token)
+                    if uid:
+                        role_rows = db.execute_query(
+                            "SELECT r.code FROM roles r "
+                            "JOIN user_roles ur ON r.id = ur.role_id "
+                            "WHERE ur.user_id = %s",
+                            (uid,),
+                        )
+                        codes = [r['code'] for r in role_rows]
+                        if 'admin' not in codes:
+                            where += ' AND create_by = %s'
+                            params.append(uid)
+                except Exception as e:
+                    logger.warning(f"解析当前用户失败，按查看全部处理: {e}")
             rows = db.execute_query(
                 'SELECT id, name, base_url, headers, variables, '
                 'create_by, create_time, update_time FROM api_environments '
-                'ORDER BY id'
+                f'WHERE {where} ORDER BY id',
+                tuple(params),
             )
             return {'code': 200, 'msg': 'success', 'data': rows}
     except Exception as e:
