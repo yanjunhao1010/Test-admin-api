@@ -559,6 +559,7 @@ def merge_impacts(items):
 
 def build_impacts(index, changes):
     impacts, changed_tables, models = {}, {}, []
+    logic_hints = {}
 
     def add(kind, key, relation, level, reason, method='', file='', line=0):
         k = (kind, key, relation, method)
@@ -618,6 +619,20 @@ def build_impacts(index, changes):
                 add('symbol', f.name, 'shared', 'must',
                     '共享函数被修改，间接影响 %d 个路由' % len(route_callers),
                     file=f.file, line=f.lineno)
+            # 兜底：只改 service / 逻辑层时，即使完全回溯不到入口接口，
+            # 也留下可追溯的验证目标，避免整份报告没有任何建议。
+            hints = [str(x)[:120] for x in (getattr(f, 'hints', None) or [])
+                     if str(x).strip()][:10]
+            why = '逻辑层函数改动：%s()（%s:%d）' % (f.name, f.file, f.lineno)
+            if route_callers:
+                why += '；已回溯 %d 个入口接口' % len(route_callers)
+            else:
+                why += '；未识别到入口接口，需人工映射到 URL/用例'
+            k = ('logic', f.name, 'logic_change', '')
+            add('logic', f.name, 'logic_change', 'suggest', why,
+                file=f.file, line=f.lineno)
+            if hints:
+                logic_hints.setdefault(k, []).extend(hints[:10])
         for q, f in ch['funcs_removed']:
             add('symbol', f.name, 'removed', 'must', '删除函数，检查调用方', file=f.file, line=f.lineno)
 
@@ -656,7 +671,27 @@ def build_impacts(index, changes):
                     '写' if write else '读', table, '/'.join(sorted(ops))),
                 '/'.join(r.methods), r.file, r.lineno)
 
+    for k, hints in logic_hints.items():
+        if k in impacts:
+            impacts[k]['hints'] = list(dict.fromkeys(hints))[:10]
     return merge_impacts(list(impacts.values())), changed_tables, models
+
+
+def logic_suggestions(imp):
+    """逻辑层函数改动的验证建议：本地确定性拼装，不依赖接口路径。
+
+    入口接口能被静态回溯时由 caller 影响项承担；这里保证「完全回溯不到」
+    时仍给出可执行的验证目标，模板覆盖不到的业务场景交给 B 号位 AI 补。
+    """
+    out = ['定位改动 `%s:%d`，构造覆盖 `%s()` 本次改动的调用场景' % (
+        imp.get('file') or '', imp.get('line') or 0, imp.get('target_key') or '')]
+    hints = imp.get('hints') or []
+    if hints:
+        out.append('重点覆盖新增/修改的代码分支：%s' % '；'.join(h[:70] for h in hints[:3]))
+    out.append('同一入参做改动前后对比：返回值、异常与数据库副作用是否只在预期分支变化')
+    if any('未识别到入口接口' in str(r) for r in (imp.get('reasons') or [])):
+        out.append('未识别到入口接口，请人工确认触达该函数的 URL/用例后再补回归')
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +916,10 @@ def analyze_range(repo_path, base, head, known_tables, assets=None, project_type
     index = ProjectIndex(repo_path, head, known_tables, project_type)
     lang, ctx = index.lang, index.ctx
     files, changes = [], []
+    kept_add, kept_del = 0, 0
     for status, path in changed_files(repo_path, base, head):
+        if languages.is_frontend_asset(path):
+            continue
         if not languages.is_source(path, lang):
             files.append({'path': path, 'status': status, 'additions': 0, 'deletions': 0,
                           'patch': '', 'is_noise': 0})
@@ -893,6 +931,8 @@ def analyze_range(repo_path, base, head, known_tables, assets=None, project_type
         if len(patch) > 150000:
             patch = patch[:150000] + '\n...[patch 已截断]'
         add, dele = stats.get(path, (0, 0))
+        kept_add += add
+        kept_del += dele
         files.append({'path': path, 'status': status, 'additions': add, 'deletions': dele,
                       'patch': patch, 'is_noise': 1 if ch['noise'] else 0})
 
@@ -907,6 +947,11 @@ def analyze_range(repo_path, base, head, known_tables, assets=None, project_type
     interfaces = assets.get('interfaces') or []
     exec_map = assets.get('exec') or {}
     for i in impacts:
+        if not i.get('relation_label'):
+            i['relation_label'] = i.get('relation') or ''
+        if i['kind'] == 'logic':
+            i['suggestions'] = logic_suggestions(i)
+            continue
         if i['kind'] != 'api':
             continue
         hit = match_interfaces(i['target_key'], i['method'], interfaces)
@@ -916,7 +961,7 @@ def analyze_range(repo_path, base, head, known_tables, assets=None, project_type
             n, s = ex.get('n') or 0, ex.get('s') or 0
             cases.append({'id': h['id'], 'name': h.get('name') or ('#%s' % h['id']),
                           'group': h.get('group'),
-                          'pass_rate': round(s * 100.0 / n, 1) if n else None})
+                          'pass_rate': round(float(s) * 100.0 / n, 1) if n else None})
         i['cases'] = cases
         i['module'] = module_of(i['target_key'])
         i['suggestions'] = build_suggestions(i, index, models)
@@ -937,8 +982,8 @@ def analyze_range(repo_path, base, head, known_tables, assets=None, project_type
         'noise': [f['path'] for f in files if f['is_noise']],
         'db_available': bool(interfaces),
         'counts': {'must': len(must), 'suggest': len(suggest), 'new': len(new),
-                   'insertions': sum(v[0] for v in stats.values()),
-                   'deletions': sum(v[1] for v in stats.values())},
+                   'insertions': kept_add,
+                   'deletions': kept_del},
         'risk_level': risk,
         'project_type': lang,
         'project_type_label': languages.label(lang),

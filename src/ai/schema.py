@@ -1243,7 +1243,83 @@ def normalize_points(raw: Any) -> Dict[str, Any]:
     }
 
 
+class CwImpactReviewItem(BaseModel):
+    """codewatch A 号位：单条「近似关联」的字段级复核结论。
+
+    为什么 verdict 默认值必须是 unknown：
+      模型漏判 / 输出被截断 / 该条没返回，回写时一律按「没判定」处理，
+      **绝不能**归一成 irrelevant（不受影响）—— 那会把 AI 没判定伪装成
+      「判定为不受影响」，制造静默假阴性（与 TpImpactItem 的 unknown 同理）。
+    """
+
+    idx: int = -1
+    verdict: str = 'unknown'   # relevant / irrelevant / unknown
+    level: str = 'keep'        # keep / must / suggest / drop
+    reason: str = ''
+
+    @field_validator('idx', mode='before')
+    @classmethod
+    def _idx(cls, v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return -1
+
+    @field_validator('verdict', mode='before')
+    @classmethod
+    def _verdict(cls, v):
+        s = _as_str(v).lower()
+        # irrelevant 含 relevant 子串，必须先判
+        if 'irrelevant' in s or '无关' in s or s in ('false', 'no', '0'):
+            return 'irrelevant'
+        if 'relevant' in s or '相关' in s or s in ('true', 'yes', '1'):
+            return 'relevant'
+        return 'unknown'
+
+    @field_validator('level', mode='before')
+    @classmethod
+    def _level(cls, v):
+        s = _as_str(v).lower()
+        if s in ('must', '必须', '高', 'up'):
+            return 'must'
+        if s in ('suggest', '建议', '低', 'downgrade', 'down'):
+            return 'suggest'
+        if s in ('drop', '删除', '移除', 'remove'):
+            return 'drop'
+        return 'keep'
+
+    @field_validator('reason', mode='before')
+    @classmethod
+    def _reason(cls, v):
+        return _as_str(v)[:200]
+
+
+class CwSceneItem(BaseModel):
+    """codewatch B 号位：模板之外补充的一条业务语义场景（一行文本）。
+
+    只收「一条场景」，本地负责去重、截断、编号与拼装；绝不让模型写整段报告。
+    """
+
+    idx: int = -1
+    scene: str = ''
+
+    @field_validator('idx', mode='before')
+    @classmethod
+    def _idx(cls, v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return -1
+
+    @field_validator('scene', mode='before')
+    @classmethod
+    def _scene(cls, v):
+        return _as_str(v)[:160]
+
+
 REQUIRED_FIELDS = {
+    CwImpactReviewItem: [],
+    CwSceneItem: [('scene', '缺少场景文本')],
     CaseDraftItem: [('function_point', '缺少功能点'), ('steps', '缺少操作步骤'),
                     ('expected_result', '缺少预期结果')],
     # 接口场景：只强制 scene_name + 有断言。

@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from src.comment import MySqlconection, yaml_data
-from src.codewatch import analyzer, languages
+from src.codewatch import analyzer, languages, review
 from src.routers.auth import parse_token
 
 logging.basicConfig(level=logging.INFO)
@@ -247,12 +247,16 @@ def _load_assets(db):
     return known, {'interfaces': interfaces, 'exec': exec_map, 'manual': manual}
 
 
-def _analyze(repo, path, base, head, db):
+def _analyze(repo, path, base, head, db, uid=0):
     known, assets = _load_assets(db)
     result = analyzer.analyze_range(
         path, base, head, known, assets,
         project_type=repo.get('project_type') or 'AUTO')
     result['manual'] = assets.get('manual') or []
+    # AI 复核层（A 关联判定 + B 场景补充）：仓库开关默认关闭，不开启时零模型调用。
+    # analyzer.py 保持纯函数，db / uid 只在这一层使用。
+    review.review(result, db, uid,
+                  enabled=int(repo.get('ai_review_enabled') or 0) == 1)
     return result
 
 
@@ -272,14 +276,33 @@ def _build_md(result, repo):
         lines.append('')
 
     apis = [i for i in result['impacts'] if i['kind'] == 'api']
+    logic = [i for i in result['impacts'] if i.get('kind') == 'logic']
     must = [i for i in apis if i['level'] == 'must']
     suggest = [i for i in apis if i['level'] == 'suggest']
     lines.append('## 一、结论')
     lines.append('')
-    lines.append('影响接口 **%d** 个：必须回归 **%d** / 建议回归 **%d**；涉及表 %d 张、模型 %d 个。%s' % (
-        len(apis), len(must), len(suggest), len(result['tables']), len(result['models']),
-        '' if result['db_available'] else '（数据库覆盖信息不可用，标为「未知」）'))
+    lines.append('影响接口 **%d** 个：必须回归 **%d** / 建议回归 **%d**；逻辑层变更 **%d** 个；'
+                 '涉及表 %d 张、模型 %d 个。%s' % (
+                     len(apis), len(must), len(suggest), len(logic),
+                     len(result['tables']), len(result['models']),
+                     '' if result['db_available'] else '（数据库覆盖信息不可用，标为「未知」）'))
     lines.append('')
+
+    ar = result.get('ai_review') or {}
+    if ar.get('enabled'):
+        lines.append('> AI 复核（A 关联判定 + B 场景补充）：状态 `%s`；近似关联 %d 条，已复核 %d 条'
+                     '（成立 %d / 误连降级 %d / 结论不可信 %d）；补充业务场景 %d 条'
+                     '（逻辑层候选 %d 个）。' % (
+                         ar.get('status') or '', ar.get('candidates') or 0,
+                         ar.get('reviewed') or 0, ar.get('relevant') or 0,
+                         ar.get('irrelevant') or 0, ar.get('unknown') or 0,
+                         ar.get('scenes') or 0, ar.get('scene_logics') or 0))
+        if ar.get('unknown'):
+            lines.append('> 注意：%d 条结论不可信，已保留原级别并标记「请重试」，未按不受影响处理。'
+                         % ar['unknown'])
+        for e in (ar.get('errors') or [])[:3]:
+            lines.append('> - 复核异常：%s' % e)
+        lines.append('')
 
     modules = {}
     for i in apis:
@@ -338,12 +361,35 @@ def _build_md(result, repo):
         for s in i.get('suggestions') or []:
             lines.append('- %s' % s)
         lines.append('')
-    lines.append('## 五、口径与局限')
+    if logic:
+        lines.append('## 五、逻辑层变更与验证建议')
+        lines.append('')
+        lines.append('> 函数体真改但可能回溯不到入口接口的逻辑单元；验证建议为静态推断，'
+                     '需人工映射到实际 URL / 用例后执行。')
+        lines.append('')
+        for i in logic:
+            lines.append('### `%s()` — `%s:%s`' % (
+                i['target_key'], i.get('file') or '', i.get('line') or 0))
+            lines.append('')
+            for r in i.get('reasons') or []:
+                lines.append('- 判定：%s' % r)
+            hints = i.get('hints') or []
+            if hints:
+                lines.append('- 本次改动代码：%s' % '；'.join(str(h)[:100] for h in hints[:5]))
+            for s in i.get('suggestions') or []:
+                lines.append('- %s' % s)
+            lines.append('')
+    lines.append('## 六、口径与局限')
     lines.append('')
     for note in (result.get('lang_notes') or languages.lang_notes('PYTHON')):
         lines.append('- ' + note)
     lines.append('- 调用链：按函数名近似匹配，深度上限 3；同名函数可能误连。')
     lines.append('- 表影响：只认同一已有函数里该表 SQL 的变化；仅 INSERT 变化不外溢，UPDATE/DELETE 才向同表接口扩散。')
+    lines.append('- 逻辑层变更：验证建议基于函数体差异与新增代码行推导，不代表真实调用关系；'
+                 '未识别到入口接口时需人工映射。')
+    if (result.get('ai_review') or {}).get('enabled'):
+        lines.append('- AI 复核只产字段级判定，报告与用例建议仍由本地拼装；'
+                     '标为「结论不可信」的条目保留静态规则原级别，需人工确认或重试。')
     lines.append('- 本报告为静态分析，不代表运行时一定出问题；分级用于排优先级。')
     return '\n'.join(lines)
 
@@ -408,6 +454,7 @@ class RepoIn(BaseModel):
     dev_branch: str = 'feature/dev'
     base_branch: str = 'master'
     project_type: str = 'AUTO'
+    ai_review_enabled: int = 0
     token: str = ''
     enabled: int = 1
 
@@ -438,6 +485,7 @@ def _repo_out(row):
         'dev_branch': row['dev_branch'], 'base_branch': row['base_branch'],
         'project_type': languages.normalize(row.get('project_type')),
         'project_type_label': languages.label(row.get('project_type')),
+        'ai_review_enabled': int(row.get('ai_review_enabled') or 0),
         'enabled': row['enabled'], 'last_sha': row['last_sha'],
         'last_sync_time': str(row['last_sync_time']) if row.get('last_sync_time') else '',
         'has_token': bool(row.get('token_enc')),
@@ -477,18 +525,20 @@ def save_repo(data: RepoIn, request: Request):
                 token_enc = _encrypt_token(db, data.token)
             db.execute_update(
                 'UPDATE cw_repos SET name=%s, repo_url=%s, dev_branch=%s, base_branch=%s, '
-                'project_type=%s, token_enc=%s, enabled=%s, update_time=NOW() WHERE id=%s',
+                'project_type=%s, ai_review_enabled=%s, token_enc=%s, enabled=%s, '
+                'update_time=NOW() WHERE id=%s',
                 (data.name.strip(), url, data.dev_branch.strip(), data.base_branch.strip(),
-                 ptype, token_enc, data.enabled, data.id))
+                 ptype, int(bool(data.ai_review_enabled)), token_enc, data.enabled, data.id))
             return _ok({'id': data.id}, '已保存')
         token_enc = _encrypt_token(db, data.token) if data.token else ''
         rid = _insert_id(
             db,
             'INSERT INTO cw_repos (name, repo_url, dev_branch, base_branch, project_type, '
-            'token_enc, enabled, create_by, create_time, update_time) '
-            'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())',
+            'ai_review_enabled, token_enc, enabled, create_by, create_time, update_time) '
+            'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())',
             (data.name.strip() or url.rsplit('/', 1)[-1], url, data.dev_branch.strip(),
-             data.base_branch.strip(), ptype, token_enc, data.enabled, uid))
+             data.base_branch.strip(), ptype, int(bool(data.ai_review_enabled)),
+             token_enc, data.enabled, uid))
     return _ok({'id': rid}, '已新增')
 
 
@@ -557,7 +607,7 @@ def sync_repo(repo_id: int, request: Request):
             base = _fallback_base(path, head)
         _check_range(path, base, head)
         with get_db_handler() as db:
-            result = _analyze(repo, path, base, head, db)
+            result = _analyze(repo, path, base, head, db, uid)
             cid = _save_change(db, repo, base, head, result, uid)
             db.execute_update(
                 'UPDATE cw_repos SET last_sha=%s, last_sync_time=NOW(), update_time=NOW() '
@@ -584,7 +634,7 @@ def create_change(data: RangeIn, request: Request):
     path = _ensure_repo(repo)
     _check_range(path, data.base, data.head)
     with get_db_handler() as db:
-        result = _analyze(repo, path, data.base, data.head, db)
+        result = _analyze(repo, path, data.base, data.head, db, uid)
         cid = _save_change(db, repo, data.base, data.head, result, uid)
     return _ok({'change_id': cid, 'counts': result['counts'],
                 'risk_level': result['risk_level']}, '分析完成')
@@ -665,7 +715,7 @@ def reanalyze(change_id: int, request: Request):
     path = _ensure_repo(repo)
     _check_range(path, row['base_sha'], row['head_sha'])
     with get_db_handler() as db:
-        result = _analyze(repo, path, row['base_sha'], row['head_sha'], db)
+        result = _analyze(repo, path, row['base_sha'], row['head_sha'], db, uid)
         db.execute_update('DELETE FROM cw_files WHERE change_id=%s', (change_id,))
         db.execute_update('DELETE FROM cw_impacts WHERE change_id=%s', (change_id,))
         db.execute_update(

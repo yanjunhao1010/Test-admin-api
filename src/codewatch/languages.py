@@ -28,6 +28,20 @@ SKIP_DIR_RE = re.compile(
     r'(?i)(^|/)(vendor|node_modules|target|build|dist|\.git|__pycache__)/')
 MAX_INDEX_FILES = 2200
 
+# 现阶段监听目标是「接口相关」的后端变更：前端页面与静态资源不纳入监听对象。
+# 这些文件既不参与影响分析，也不写进变更文件列表（避免详情页出现大量「无 diff 内容」）。
+FRONTEND_ASSET_EXT = (
+    '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.vue', '.svelte',
+    '.css', '.scss', '.sass', '.less', '.styl', '.html', '.htm',
+    '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.webp', '.bmp',
+    '.woff', '.woff2', '.ttf', '.eot', '.map', '.mp3', '.mp4',
+)
+
+
+def is_frontend_asset(path):
+    """前端页面 / 静态资源：不纳入代码变更监听（当前只关注接口相关后端变更）。"""
+    return bool(path) and path.lower().endswith(FRONTEND_ASSET_EXT)
+
 LABELS = {
     AUTO: '自动识别', PYTHON: 'PYTHON', PHP: 'PHP', JAVA: 'JAVA',
 }
@@ -184,7 +198,8 @@ def build_context(repo, ref, project_type=AUTO):
         route_paths = [p for p in all_paths if is_source(p, PHP) and _is_route_file(p)]
         route_sources = read_sources(repo, ref, entries, route_paths)
         ctx['controller_root'] = _controller_root(all_paths)
-        ctx['php_routes'] = parse_php_routes(route_sources, ctx['controller_root'])
+        ctx['php_routes'] = parse_php_routes(route_sources, ctx['controller_root'],
+                                             set(all_paths))
         names = set()
         for text in sources.values():
             for nm in re.finditer(r'(?im)^\s*class\s+([A-Za-z_]\w*Validate)\b', text):
@@ -373,10 +388,18 @@ def _parse_route_file(src, path):
     return routes
 
 
-def _resolve_target(target, prefix, root):
-    """把 Route::get('list', '/list') + prefix 解析成 (控制器文件, 方法名)。"""
+def _resolve_target(target, prefix, root, known_files=None):
+    """把 Route::get('list', '/list') + prefix 解析成 (控制器文件, 方法名)。
+
+    ThinkPHP 的 group prefix 有两种写法：
+    - 完整类名：`->prefix('admin.activity.ActivityType')` + target `/list`
+    - 命名空间前缀：`->prefix('api.user.')` + target `UserCfca/startAuth`
+      此时 target 里的 `UserCfca` 才是控制器类名，必须拼到 prefix 后面，
+      否则会定位到不存在的 `app/controller/api/user.php`，调用链整条断掉。
+    """
     t = (target or '').strip().strip("'\"")
     cls, action = prefix or '', 'index'
+    ctrl_seg = ''
     if t.startswith('/'):
         action = t.lstrip('/').split('/')[-1] or 'index'
     elif '@' in t:
@@ -385,22 +408,39 @@ def _resolve_target(target, prefix, root):
         left, action = t.rsplit('/', 1)
         if left and ('.' in left or not cls):
             cls = left
+        elif left and cls.endswith('.'):
+            ctrl_seg = left
     elif t:
         action = t
-    segs = [s for s in cls.replace('.', '/').replace('\\', '/').split('/') if s]
-    if not segs or not root:
-        return '', action
-    return root + '/'.join(segs) + '.php', action
+
+    def build(c):
+        segs = [s for s in c.replace('.', '/').replace('\\', '/').split('/') if s]
+        if not segs or not root:
+            return ''
+        return root + '/'.join(segs) + '.php'
+
+    primary = build(cls)
+    candidates = [build(cls + ctrl_seg), primary] if ctrl_seg else [primary]
+    if known_files:
+        for c in candidates:
+            if c and c in known_files:
+                return c, action
+    return (candidates[0] or ''), action
 
 
-def parse_php_routes(route_sources, controller_root):
-    """返回 {'by_controller': {(file, action): [route]}, 'all': [route]}。"""
+def parse_php_routes(route_sources, controller_root, known_files=None):
+    """返回 {'by_controller': {(file, action): [route]}, 'all': [route]}。
+
+    known_files 是提交树里的真实文件路径集合，用来在多种候选写法里挑中实际存在的
+    控制器文件；不传时按语法规则取首选候选（保持离线单文件测试可用）。
+    """
     all_routes = []
     for path, src in (route_sources or {}).items():
         all_routes.extend(_parse_route_file(src, path))
     by_controller = defaultdict(list)
     for r in all_routes:
-        cfile, action = _resolve_target(r['target'], r.get('prefix'), controller_root)
+        cfile, action = _resolve_target(r['target'], r.get('prefix'),
+                                        controller_root, known_files)
         r['controller_file'], r['action'] = cfile, action
         if cfile:
             by_controller[(cfile, action)].append(r)
